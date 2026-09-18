@@ -16,9 +16,9 @@ Every shape below is taken from the source, not idealised.
 - [Gateway HTTP API](#gateway-http-api)
 - [CLI reference](#cli-reference)
 - [Logging](#logging)
+- [Environment variables](#environment-variables)
+- [Platform notes](#platform-notes)
 - [Recipes](#recipes)
-
----
 
 ## Getting a client
 
@@ -452,10 +452,42 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 limits and per-account failures. `DEBUG` adds browser console output when the
 CAPTCHA solver runs.
 
-CAPTCHA diagnostics are written to disk when the solver runs:
-`/tmp/proton-captcha-bg.png` (raw background) and
-`/tmp/proton-captcha-detected.png` (detected hole marked). A failed browser
-login also leaves `/tmp/proton-login-failed.png`.
+CAPTCHA diagnostics are written to the platform temp directory when the solver
+runs: `proton-captcha-bg.png` (raw background) and
+`proton-captcha-detected.png` (detected hole marked). A failed browser login
+also leaves `proton-login-failed.png`. The directory is `tempfile.gettempdir()`
+— `$TMPDIR` on POSIX, `%TEMP%` on Windows.
+
+---
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `PROTON_NODE_BIN` | Node executable to run. Default: `node`, then `nodejs`, resolved with `shutil.which` |
+| `PROTON_HEADLESS` | `0` shows the CAPTCHA browser window. Default headless |
+| `PROTON_GATEWAY_TOKEN` | Gateway bearer token. Generated and printed if unset |
+| `TMPDIR` / `TEMP` | Where diagnostics are written |
+
+---
+
+## Platform notes
+
+Linux, macOS, and Windows are all supported — the library is pure Python plus a
+Node subprocess.
+
+- **Node discovery.** Resolved with `shutil.which`, which expands `%PATHEXT%`,
+  so an nvm/fnm `node.cmd` shim on Windows is found. `subprocess.Popen` handed a
+  bare `"node"` would not run it. Set `PROTON_NODE_BIN` if Node is off PATH.
+- **Worker encoding.** The Node worker speaks UTF-8 JSON, and the pipe is pinned
+  to UTF-8 explicitly — relying on the platform's preferred encoding would
+  mangle every non-ASCII mail body on Windows (cp1252).
+- **Config permissions.** Written owner-only via `os.fchmod`, falling back to
+  `os.chmod` where the fd variant is missing (Windows has no `os.fchmod`). On
+  Windows the POSIX bit does not apply, so keep the file out of shared
+  directories: it holds your password and PGP private keys.
+- **Atomic writes.** `tempfile.mkstemp` in the config's own directory followed
+  by `os.replace`, which is atomic on both POSIX and Windows.
 
 ---
 

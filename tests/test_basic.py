@@ -70,6 +70,67 @@ def test_a_config_without_usable_credentials_is_refused(tmp_path):
         ProtonMailClient(str(empty))
 
 
+# -- portability ------------------------------------------------------
+#
+# The package claims OS Independent. Three things used to break that: os.fchmod
+# does not exist on Windows, diagnostics were written to a literal /tmp, and a
+# bare "node" handed to Popen never finds an nvm/fnm `node.cmd` shim.
+
+
+def test_config_is_saved_where_fchmod_does_not_exist(client, monkeypatch):
+    """Windows has no os.fchmod; losing the session there is not acceptable."""
+    monkeypatch.delattr(os, "fchmod", raising=False)
+
+    client.config["uid"] = "saved-without-fchmod"
+    client._save_config()
+
+    on_disk = json.loads(pathlib.Path(client.config_path).read_text())
+    assert on_disk["uid"] == "saved-without-fchmod"
+
+
+def test_a_failed_save_leaves_no_temp_file_behind(client, monkeypatch):
+    """A crash mid-write must not litter the config directory."""
+    def boom(*a, **kw):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(json, "dump", boom)
+    with pytest.raises(RuntimeError, match="disk full"):
+        client._save_config()
+
+    directory = pathlib.Path(client.config_path).parent
+    assert list(directory.glob(".proton-config-*")) == []
+
+
+def test_diagnostics_go_to_the_platform_temp_dir():
+    """A literal /tmp does not exist on Windows."""
+    import tempfile as _tempfile
+
+    from proton_mail_api.captcha import PuzzleSolver
+
+    for path in (PuzzleSolver.DEBUG_BG, PuzzleSolver.DEBUG_MARKED):
+        assert path.startswith(_tempfile.gettempdir())
+        assert path != os.path.join("/tmp", os.path.basename(path)) or \
+            _tempfile.gettempdir() == "/tmp"
+
+
+def test_node_is_resolved_through_which_not_handed_to_popen():
+    """Popen does not expand %PATHEXT%, so `node.cmd` on Windows needs which."""
+    from proton_mail_api.crypto_worker import _resolve_node
+
+    resolved = _resolve_node()
+    # Either an absolute path from which(), or the bare name when Node is
+    # absent — so start() can still raise its install hint.
+    assert os.path.isabs(resolved) or resolved == "node"
+
+
+def test_an_explicit_node_binary_wins(monkeypatch):
+    """nvm/fnm shells often never export node onto PATH."""
+    from proton_mail_api import crypto_worker
+
+    monkeypatch.setenv("PROTON_NODE_BIN", "/opt/custom/node")
+    assert crypto_worker._resolve_node() == "/opt/custom/node"
+
+
 def test_auth_headers_track_the_current_token(client):
     """Callers rely on the shared client carrying the live token."""
     assert client._http.headers["x-pm-uid"] == "test-uid"

@@ -29,6 +29,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
 
 log = logging.getLogger(__name__)
@@ -243,8 +245,13 @@ class PuzzleSolver:
     # Diagnostic dumps. When the puzzle gets dragged to the wrong place these
     # are the only meaningful evidence: the raw background and the detected
     # hole marked on it.
-    DEBUG_BG = "/tmp/proton-captcha-bg.png"
-    DEBUG_MARKED = "/tmp/proton-captcha-detected.png"
+    #
+    # tempfile.gettempdir() rather than a literal "/tmp": Windows has no /tmp,
+    # and honouring TMPDIR also keeps the dumps out of a read-only /tmp.
+    DEBUG_BG = os.path.join(tempfile.gettempdir(), "proton-captcha-bg.png")
+    DEBUG_MARKED = os.path.join(
+        tempfile.gettempdir(), "proton-captcha-detected.png"
+    )
 
     def _dump_debug(self, answer_x, answer_y):
         """Write the background and the detected hole to disk (debugging)."""

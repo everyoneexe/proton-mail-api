@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import threading
 from collections import deque
@@ -29,6 +30,29 @@ log = logging.getLogger(__name__)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKER_SCRIPT = os.path.join(SCRIPT_DIR, "decrypt", "worker.mjs")
+
+# Which Node to run. $PROTON_NODE_BIN covers what PATH cannot: nvm/fnm shells
+# that never exported it, Windows installs outside PATH, and systems where the
+# binary is called "nodejs".
+_NODE_NAMES = ("node", "nodejs")
+
+
+def _resolve_node():
+    """Return the Node executable to launch.
+
+    Resolved with shutil.which rather than handed to Popen as a bare name:
+    which expands %PATHEXT% on Windows, so an nvm/fnm `node.cmd` shim is found,
+    while Popen(shell=False) would not run it. Falls back to the bare name so
+    the FileNotFoundError (and its install hint) still surfaces at start().
+    """
+    override = os.environ.get("PROTON_NODE_BIN")
+    if override:
+        return shutil.which(override) or override
+    for name in _NODE_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    return _NODE_NAMES[0]
 
 _EOF = object()  # sentinel pushed when the worker's stdout closes
 
@@ -93,17 +117,25 @@ class CryptoWorker:
 
             try:
                 proc = subprocess.Popen(
-                    ["node", WORKER_SCRIPT],
+                    [_resolve_node(), WORKER_SCRIPT],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    # The worker writes UTF-8 JSON. Without pinning it, text
+                    # mode decodes with the platform's preferred encoding
+                    # (cp1252 on Windows), which mangles every non-ASCII mail
+                    # body. errors="replace" keeps a damaged byte from killing
+                    # the reader thread outright.
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,  # line buffered
                 )
             except FileNotFoundError:
                 raise WorkerUnavailable(
                     "Node.js not found. proton-mail-api requires Node.js >= 18 "
-                    "for PGP operations. Install it and ensure `node` is on PATH."
+                    "for PGP operations. Install it and ensure `node` is on "
+                    "PATH, or point $PROTON_NODE_BIN at the executable."
                 )
 
             self._proc = proc

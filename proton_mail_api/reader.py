@@ -143,7 +143,7 @@ class ProtonReader:
             )
 
     def _save_config(self):
-        """Write the config atomically with 0600 permissions.
+        """Write the config atomically with owner-only permissions.
 
         Writing straight with open(path, "w") truncates the file first; if a
         second process/thread refreshing the same config slips in between, the
@@ -156,15 +156,28 @@ class ProtonReader:
             dir=directory, prefix=".proton-config-", suffix=".tmp"
         )
         try:
-            # 0600 — do not expose secrets to the world
-            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+            # Owner-only: the file holds the password, session tokens and PGP
+            # private keys. os.fchmod does not exist on Windows, where mkstemp
+            # already creates the file with no sharing; fall back to chmod by
+            # path so the bit is at least set on POSIX-like runtimes that lack
+            # the fd variant.
+            try:
+                os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+            except (AttributeError, NotImplementedError, OSError):
+                try:
+                    os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+                except OSError:
+                    pass
             with os.fdopen(fd, "w") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, self.config_path)
         except BaseException:
-            os.unlink(tmp_path)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             raise
 
     def _headers(self):
@@ -453,9 +466,13 @@ class ProtonReader:
                     return uid, access, refresh
                 except Exception as e:
                     # Diagnostics: screenshot + last URL. Enrich the error
-                    # without swallowing it.
+                    # without swallowing it. `shot` is bound before the branch:
+                    # if the failure happened before a page existed, the
+                    # CaptchaError path below would otherwise raise NameError
+                    # and hide the real error.
+                    shot = os.path.join(tempfile.gettempdir(),
+                                        "proton-login-failed.png")
                     if page is not None:
-                        shot = "/tmp/proton-login-failed.png"
                         try:
                             await page.screenshot(path=shot, full_page=True)
                             log.error("Login failed at %s — screenshot: %s",
@@ -467,9 +484,7 @@ class ProtonReader:
                                         "(inspect the window)", keep_open)
                             await page.wait_for_timeout(keep_open * 1000)
                     if isinstance(e, CaptchaError):
-                        raise CaptchaError(
-                            f"{e} (screenshot: /tmp/proton-login-failed.png)"
-                        ) from e
+                        raise CaptchaError(f"{e} (screenshot: {shot})") from e
                     raise
                 finally:
                     await browser.close()

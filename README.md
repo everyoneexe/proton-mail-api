@@ -87,6 +87,21 @@ The `captcha` and `browser` extras also need a browser binary:
 playwright install chromium
 ```
 
+### Platforms
+
+Pure Python plus a Node subprocess, so Linux, macOS, and Windows all work.
+Two details are worth knowing:
+
+- Node is located with `shutil.which`, so an nvm/fnm `node.cmd` shim on Windows
+  is found. If Node lives somewhere PATH does not reach, point
+  `PROTON_NODE_BIN` at the executable.
+- Diagnostics (CAPTCHA dumps, failed-login screenshots) go to the platform temp
+  directory — `TMPDIR` on POSIX, `%TEMP%` on Windows — not a literal `/tmp`.
+
+Config files are written with owner-only permissions where the OS supports it.
+On Windows the `0600` bit does not apply; the file still holds your password and
+PGP private keys, so keep it out of a shared directory.
+
 ## Quick start
 
 Two fields are enough:
@@ -368,7 +383,7 @@ cd proton-mail-api
 pip install -e '.[all]'
 cd proton_mail_api/decrypt && npm install && cd -
 
-pytest tests/ -q          # 165 tests, no network required
+pytest tests/ -q          # 170 tests, no network required
 ruff check proton_mail_api tests
 ```
 
