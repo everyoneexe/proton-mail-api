@@ -39,6 +39,37 @@ def test_public_alias_is_the_reader():
     assert ProtonMailClient is ProtonReader
 
 
+# -- config loading ---------------------------------------------------
+#
+# A missing or malformed config is a setup mistake. Reporting it as a raw
+# traceback through open()/json.load() buries the one fact the user needs.
+
+
+def test_a_missing_config_names_the_path_and_the_fix(tmp_path):
+    missing = tmp_path / "nope.json"
+    with pytest.raises(FileNotFoundError) as e:
+        ProtonMailClient(str(missing))
+    msg = str(e.value)
+    assert str(missing) in msg
+    assert "login" in msg, "the message must say how to populate the file"
+
+
+def test_a_malformed_config_reports_the_json_position(tmp_path):
+    broken = tmp_path / "broken.json"
+    broken.write_text('{"email": "a@b.c",}')
+    with pytest.raises(ValueError, match="not valid JSON") as e:
+        ProtonMailClient(str(broken))
+    assert "line" in str(e.value) and "column" in str(e.value)
+
+
+def test_a_config_without_usable_credentials_is_refused(tmp_path):
+    """Neither a session nor a password means nothing can be done with it."""
+    empty = tmp_path / "empty.json"
+    empty.write_text('{"email": "a@b.c"}')
+    with pytest.raises(ValueError, match="email\\+password"):
+        ProtonMailClient(str(empty))
+
+
 def test_auth_headers_track_the_current_token(client):
     """Callers rely on the shared client carrying the live token."""
     assert client._http.headers["x-pm-uid"] == "test-uid"

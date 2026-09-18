@@ -115,8 +115,22 @@ class ProtonReader:
         uid/auth_token are NOT REQUIRED: a config with only email+password is
         valid, and the session is opened through SRP via login().
         """
-        with open(self.config_path) as f:
-            self.config = json.load(f)
+        # A missing or malformed config is a setup mistake, not a bug: report it
+        # in one line instead of a stack trace through open()/json.load().
+        try:
+            with open(self.config_path) as f:
+                self.config = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"{self.config_path}: no such config file. Create it with at "
+                'least {"email": "you@proton.me", "password": "..."} and run '
+                "`proton-mail --config <file> login`"
+            ) from None
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"{self.config_path}: not valid JSON (line {e.lineno}, "
+                f"column {e.colno}): {e.msg}"
+            ) from None
         self.uid = self.config.get("uid", "")
         self.auth_token = self.config.get("auth_token", "")
         self.email = self.config.get("email", "")
