@@ -8,8 +8,11 @@ the same HTTP API the web client uses, performs the SRP handshake, and decrypts
 message bodies locally — so a script can read Proton mail without a browser
 sitting open.
 
+[![PyPI](https://img.shields.io/pypi/v/proton-mail-api)](https://pypi.org/project/proton-mail-api/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+**[Full API reference → DOCS.md](DOCS.md)**
 
 ---
 
