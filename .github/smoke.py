@@ -31,9 +31,20 @@ from proton_mail_api.crypto_worker import (
 failures = []
 
 
+def note(line):
+    """Print a line the terminal can actually encode.
+
+    Windows consoles default to cp1252 before 3.15, so printing a decrypted
+    body or a subprocess's stderr would raise UnicodeEncodeError and fail the
+    run for a reporting reason rather than a real one.
+    """
+    enc = sys.stdout.encoding or "ascii"
+    print(line.encode(enc, errors="backslashreplace").decode(enc))
+
+
 def check(label, condition, detail=""):
     status = "ok  " if condition else "FAIL"
-    print(f"  {status} {label}{f'  {detail}' if detail else ''}")
+    note(f"  {status} {label}{f'  {detail}' if detail else ''}")
     if not condition:
         failures.append(label)
 
@@ -79,7 +90,7 @@ def _make_encrypted_fixture(plain):
         script.unlink(missing_ok=True)
 
     if result.returncode != 0:
-        print(f"  note: fixture generation failed: {result.stderr[-200:]}")
+        note(f"  note: fixture generation failed: {result.stderr[-200:]}")
         return None
     return tuple(json.loads(result.stdout))
 
@@ -140,11 +151,12 @@ with tempfile.TemporaryDirectory() as d:
         leftovers = list(pathlib.Path(d).glob(".proton-config-*"))
         check("no temp file left behind", leftovers == [], str(leftovers))
 
-        if hasattr(os, "fchmod"):
+        if os.name == "posix":
             mode = path.stat().st_mode & 0o777
             check("owner-only permissions", mode == 0o600, oct(mode))
         else:
-            print("  skip owner-only permissions (no os.fchmod on this OS)")
+            print(f"  skip owner-only permissions (os.name={os.name!r}: "
+                  "POSIX bits are not enforced here)")
     finally:
         client.close()
 

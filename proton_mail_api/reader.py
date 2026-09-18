@@ -157,10 +157,13 @@ class ProtonReader:
         )
         try:
             # Owner-only: the file holds the password, session tokens and PGP
-            # private keys. os.fchmod does not exist on Windows, where mkstemp
-            # already creates the file with no sharing; fall back to chmod by
-            # path so the bit is at least set on POSIX-like runtimes that lack
-            # the fd variant.
+            # private keys.
+            #
+            # Windows does have os.fchmod, but it does not enforce POSIX bits
+            # -- the mode reads back 0o666 whatever is requested (measured on
+            # CI). Nothing can be done about that from here; the file is still
+            # created by mkstemp, which does not share it. The fallback to
+            # chmod-by-path covers runtimes that lack the fd variant entirely.
             try:
                 os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
             except (AttributeError, NotImplementedError, OSError):

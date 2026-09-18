@@ -483,9 +483,10 @@ Node subprocess.
   to UTF-8 explicitly — relying on the platform's preferred encoding would
   mangle every non-ASCII mail body on Windows (cp1252).
 - **Config permissions.** Written owner-only via `os.fchmod`, falling back to
-  `os.chmod` where the fd variant is missing (Windows has no `os.fchmod`). On
-  Windows the POSIX bit does not apply, so keep the file out of shared
-  directories: it holds your password and PGP private keys.
+  `os.chmod` where the fd variant is missing. Windows *has* `os.fchmod` but does
+  not enforce POSIX bits — the mode reads back `0o666` whatever is requested
+  (measured on CI). So on Windows keep the file out of a shared directory: it
+  holds your password and PGP private keys.
 - **Atomic writes.** `tempfile.mkstemp` in the config's own directory followed
   by `os.replace`, which is atomic on both POSIX and Windows.
 

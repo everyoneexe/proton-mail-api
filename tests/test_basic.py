@@ -152,11 +152,10 @@ def test_save_config_is_private_and_atomic(client, config_path):
     client.config["key_salt"] = "abc"
     client._save_config()
 
-    # POSIX permission bits do not exist on Windows: os.chmod there only
-    # toggles the read-only flag, so the mode comes back 0o666 no matter what
-    # was requested. Asserting 0o600 unconditionally fails on a platform the
-    # package claims to support.
-    if hasattr(os, "fchmod"):
+    # POSIX permission bits are not enforced on Windows. os.fchmod exists
+    # there -- measured on CI -- but the mode still reads back 0o666, so
+    # hasattr is the wrong gate; os.name is the honest one.
+    if os.name == "posix":
         mode = stat.S_IMODE(os.stat(config_path).st_mode)
         assert mode == 0o600, f"secrets world-readable: {oct(mode)}"
 
