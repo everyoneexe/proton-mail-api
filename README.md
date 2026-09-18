@@ -13,31 +13,22 @@ sitting open.
 
 ---
 
-## ⚠️ Eğitim amaçlıdır / Educational purposes
+## ⚠️ Educational purposes
 
-**Türkçe.** Bu proje Proton'un HTTP API'sini, SRP sıfır-bilgi kimlik
-doğrulamasını ve PGP anahtar zincirini **öğrenmek ve incelemek** için yazıldı.
-Kendi hesabınızda kullanın.
+This project was written to **study** Proton's HTTP API, its SRP zero-knowledge
+authentication, and its PGP key chain. Use it on accounts you own.
 
-- Proton'un [Şartlar ve Koşulları](https://proton.me/legal/terms)'na uymak
-  sizin sorumluluğunuzdadır. Resmî olmayan bir istemcidir; Proton tarafından
-  desteklenmez veya onaylanmaz.
-- Size ait olmayan hesaplarda kullanmayın. Toplu hesap oluşturma, spam,
-  istenmeyen otomasyon veya başkasının doğrulama kodunu ele geçirmek için
-  kullanmayın.
-- CAPTCHA çözücü, Proton'un insan doğrulamasının bu kütüphaneyi engellediği
-  durumları **incelemek** için vardır — bot koruması aşma aracı olarak değil.
-- API haber verilmeden değişir. Bu kod belirli bir tarihte gözlemlenen davranışa
-  göre yazıldı; bozulabilir.
-- Garanti verilmez. Veri kaybı, hesap kilitlenmesi veya askıya alınmasından
-  yazar sorumlu değildir.
-
-**English.** Written to study Proton's HTTP API, SRP zero-knowledge
-authentication, and PGP key chain. Use it on accounts you own. Unofficial
-client, not endorsed by Proton; complying with their
-[Terms](https://proton.me/legal/terms) is your responsibility. Do not use for
-bulk account creation, spam, or harvesting other people's verification codes.
-No warranty.
+- Complying with Proton's [Terms and Conditions](https://proton.me/legal/terms)
+  is your responsibility. This is an unofficial client: not supported,
+  endorsed, or affiliated with Proton AG.
+- Do not use it on accounts that are not yours. Not for bulk account creation,
+  spam, unsolicited automation, or harvesting someone else's verification codes.
+- The CAPTCHA solver exists to **study** the cases where Proton's human
+  verification blocks this library — not as a bot-protection bypass tool.
+- The API changes without notice. This code was written against behaviour
+  observed on a specific date; it can break.
+- No warranty. The author is not liable for data loss, account lockout, or
+  suspension.
 
 ---
 

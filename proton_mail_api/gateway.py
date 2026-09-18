@@ -126,7 +126,7 @@ def init_readers(config_list):
         if not config_path:
             continue
         r = ProtonReader(config_path)
-        # Alias: config dosya adından türet
+        # Alias: derive it from the config filename
         alias = os.path.basename(config_path)
         for suffix in ("_account.json", ".json"):
             if alias.endswith(suffix):
@@ -241,13 +241,13 @@ def messages():
     return jsonify(r.inbox(page=page, size=size, unread_only=unread))
 
 
-# Proton'a aynı anda kaç hesapla gidileceği. Sıralı tarama hesap sayısıyla
-# doğrusal büyür (ilk sayfa hesap başına saniyeler sürebiliyor); havuzu sınırlı
-# tutmak hepsinin birlikte 429 yemesini önler.
+# How many accounts Proton is queried with at once. A sequential scan grows
+# linearly with the account count (the first page can take seconds per
+# account); keeping the pool bounded stops every account hitting 429 together.
 _RECENT_WORKERS = 4
 
-# decrypt=1 için ayrı ve düşük tavan: her gövde tek Node worker'ın arkasında
-# sıraya girer, bu yüzden 50 mesaj decrypt etmek isteği dakikalarca bloke eder.
+# A separate, low ceiling for decrypt=1: every body queues behind the single
+# Node worker, so decrypting 50 messages would block the request for minutes.
 _DECRYPT_LIMIT = 10
 
 
@@ -315,7 +315,7 @@ def recent():
         "count": len(merged),
         "decrypted": decrypt,
         "messages": merged,
-        "errors": errors,  # hesap başına bozulma; detay logda
+        "errors": errors,  # per-account breakage; detail stays in the log
     })
 
 
@@ -343,8 +343,8 @@ def read_message(msg_id):
 @require_token
 def addresses():
     if request.args.get("all", "0") == "1":
-        # Tek hesabın hatası tüm yanıtı düşürmesin; hata detayı logda kalır,
-        # istemciye Proton API gövdesi sızmaz.
+        # One account's failure must not blank the whole response; the error
+        # detail stays in the log and no Proton API body leaks to the client.
         out = {}
         for alias, r in sorted(readers.items()):
             try:

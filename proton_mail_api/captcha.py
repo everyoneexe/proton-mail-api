@@ -1,22 +1,26 @@
 """
-Proton puzzle CAPTCHA solver — login akışında çıkan "Human Verification".
+Proton puzzle CAPTCHA solver — the "Human Verification" step of the login flow.
 
-Proton, şifre doğru olsa bile login'de puzzle CAPTCHA isteyebilir. SRP akışı
-saf HTTP'dir ama CAPTCHA tarayıcı içinde çözülmek zorunda: doğrulama isteği
-`pcaptcha` header'ı ve canvas üzerinde hesaplanan koordinatlarla gidiyor.
+Proton may demand a puzzle CAPTCHA at login even when the password is correct.
+The SRP flow is pure HTTP, but the CAPTCHA has to be solved inside a browser:
+the validate request goes out with the `pcaptcha` header and with coordinates
+computed on the canvas.
 
-Çözüm üç parçadan oluşur:
+The solution consists of three parts:
 
-1. **Delik bulma (OpenCV).** Arka plan görselindeki puzzle boşluğu, beyaz
-   kontura komşu koyu bölge olarak aranır. Şeffaf siyah delikler için "relative
-   dark" (bulanıklaştırılmış görüntüden fark), tam siyah delikler için "absolute
-   dark" eşiklemesi kullanılır; iki adaydan alanı büyük olan seçilir.
-2. **Proof-of-work.** Proton `init` yanıtında N tane challenge ve gereken
-   sıfır sayısını verir; her challenge için sha256 önek koşulunu sağlayan sayı
-   bulunur. Süreç havuzunda paralel hesaplanır (CPU-bound).
-3. **Parçayı taşıma.** Canvas'a tıklanıp ok tuşlarıyla (adım = 2px) parça
-   hedefe götürülür. Fare sürüklemesi yerine ok tuşu: koordinatı tarayıcının
-   kendisi hesaplar, bizim piksel tahminimiz doğrulama isteğine girmez.
+1. **Hole detection (OpenCV).** The puzzle gap in the background image is
+   searched for as a dark region adjacent to a white contour. For transparent
+   black holes a "relative dark" mask is used (the difference against a
+   blurred copy of the image), for fully black holes an "absolute dark"
+   threshold; of the two candidates the one with the larger area is picked.
+2. **Proof-of-work.** Proton's `init` response supplies N challenges and the
+   required number of zeros; for each challenge a number satisfying the sha256
+   prefix condition is found. Computed in parallel in a process pool
+   (CPU-bound).
+3. **Moving the piece.** The canvas is clicked and the piece is walked to the
+   target with the arrow keys (step = 2px). Arrow keys instead of a mouse
+   drag: the browser itself computes the coordinate, so our own pixel guess
+   never enters the validate request.
 
 Requires: pip install proton-mail-api[captcha]  (playwright + opencv + numpy)
 """
@@ -29,33 +33,38 @@ from concurrent.futures import ProcessPoolExecutor
 
 log = logging.getLogger(__name__)
 
-# PIXI sahne sabitleri — Proton'un captcha canvas'ından.
-# answer = {x: sprite.x - 32, y: sprite.y - 82}, arka plan y ofseti 50.
+# PIXI scene constants — from Proton's captcha canvas.
+# answer = {x: sprite.x - 32, y: sprite.y - 82}, background y offset 50.
 _SPRITE_X0 = 32
 _SPRITE_Y0 = 32
 _ANSWER_X_OFF = 32
 _ANSWER_Y_OFF = 82
 _BG_Y_OFF = 50
-_ARROW_STEP = 2  # ok tuşu başına piksel
+_ARROW_STEP = 2  # pixels per arrow key press
 
 
 class CaptchaError(RuntimeError):
-    """CAPTCHA çözülemedi."""
+    """CAPTCHA could not be solved."""
 
 
 def _pow_single(challenge, n_zeros):
-    """Bir challenge için sha256 önek koşulunu sağlayan sayıyı bul."""
+    """Find a number satisfying the sha256 prefix condition for a challenge.
+
+    Counts up from zero, hashing f"{i}{challenge}", until the digest starts
+    with `n_zeros` zero bits — i.e. until its leading hex nibbles, read as an
+    integer, fall below `threshold`.
+    """
     n = (n_zeros + 3) // 4
     threshold = 2 ** (n * 4 - n_zeros)
     for i in range(10_000_000):
         h = hashlib.sha256(f"{i}{challenge}".encode()).hexdigest()
         if int(h[:n], 16) < threshold:
             return i
-    raise CaptchaError(f"Proof-of-work çözülemedi: {challenge}")
+    raise CaptchaError(f"Proof-of-work unsolved: {challenge}")
 
 
 def solve_pow(challenges, n_zeros, workers=None):
-    """Tüm challenge'ları paralel çöz. CPU-bound olduğu için süreç havuzu."""
+    """Solve every challenge in parallel. A process pool, since it is CPU-bound."""
     if not challenges:
         return []
     with ProcessPoolExecutor(max_workers=workers) as ex:
@@ -63,15 +72,17 @@ def solve_pow(challenges, n_zeros, workers=None):
 
 
 def find_hole(bg_bytes):
-    """Arka plandaki puzzle deliğini bul, (answer_x, answer_y) döndür.
+    """Find the puzzle hole in the background, return (answer_x, answer_y).
 
-    Delik, beyaz konturla çevrili koyu bölgedir. Tek bir eşik yetmez: bazı
-    delikler şeffaf (arka planı koyultur), bazıları tam siyahtır. İkisi ayrı
-    maskelenip birleştirilir, en büyük aday seçilir.
+    The hole is a dark region surrounded by a white contour. A single
+    threshold does not suffice: some holes are transparent (they darken the
+    background), others are fully black. The two are masked separately and
+    then merged, and the largest candidate is selected.
 
     Raises:
-        CaptchaError: Delik bulunamazsa. Sıfır koordinat döndürmek sessizce
-            yanlış cevap göndermek olur; hata vermek doğrusu.
+        CaptchaError: If the hole is not found. Returning zero coordinates
+            would mean silently submitting a wrong answer; raising is the
+            correct behaviour.
     """
     try:
         import cv2
@@ -84,11 +95,11 @@ def find_hole(bg_bytes):
 
     bg = cv2.imdecode(np.frombuffer(bg_bytes, np.uint8), cv2.IMREAD_COLOR)
     if bg is None:
-        raise CaptchaError("CAPTCHA arka planı çözümlenemedi (bozuk görsel)")
+        raise CaptchaError("CAPTCHA background could not be decoded (corrupt image)")
     gray = cv2.cvtColor(bg, cv2.COLOR_BGR2GRAY)
     h_img, w_img = bg.shape[:2]
 
-    # Deliğin beyaz konturu — genişletilip maske olarak kullanılır.
+    # The white contour of the hole — dilated and used as a mask.
     _, white = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
     white_dilated = cv2.dilate(white, np.ones((5, 5), np.uint8), iterations=3)
 
@@ -104,7 +115,7 @@ def find_hole(bg_bytes):
             if area < 200:
                 continue
             _, _, cw, ch = cv2.boundingRect(c)
-            # Parça boyutu makul olmalı: çok küçük = gürültü, çok büyük = sahne.
+            # Piece size must be plausible: too small = noise, too big = scene.
             if cw < 20 or ch < 20:
                 continue
             if cw > w_img * 0.5 or ch > h_img * 0.5:
@@ -115,16 +126,16 @@ def find_hole(bg_bytes):
             out.append((area, c))
         return out
 
-    # Şeffaf delikler: yerel ortalamadan belirgin koyu olan bölgeler.
+    # Transparent holes: regions noticeably darker than the local average.
     blur = cv2.GaussianBlur(gray, (21, 21), 0)
     diff = np.clip(blur.astype(int) - gray.astype(int), 0, 255).astype(np.uint8)
     _, dark_rel = cv2.threshold(diff, 15, 255, cv2.THRESH_BINARY)
-    # Tam siyah delikler.
+    # Fully black holes.
     _, dark_abs = cv2.threshold(gray, 80, 255, cv2.THRESH_BINARY_INV)
 
     found = candidates(dark_rel) + candidates(dark_abs)
     if not found:
-        raise CaptchaError("Puzzle deliği bulunamadı")
+        raise CaptchaError("Puzzle hole not found")
 
     hole = max(found, key=lambda c: c[0])[1]
     x, y, cw, ch = cv2.boundingRect(hole)
@@ -136,20 +147,26 @@ def find_hole(bg_bytes):
 
 
 def arrow_steps(answer_x, answer_y):
-    """Hedefe ulaşmak için gereken (yatay, dikey) ok tuşu adımı."""
+    """The (horizontal, vertical) arrow key steps needed to reach the target.
+
+    The piece starts at the PIXI sprite origin (_SPRITE_X0, _SPRITE_Y0) and
+    every arrow key press shifts it by _ARROW_STEP (2) pixels, so the distance
+    from that origin to the answer coordinate divided by the step size gives
+    the number of presses.
+    """
     steps_x = (answer_x + _ANSWER_X_OFF - _SPRITE_X0) // _ARROW_STEP
     steps_y = (answer_y + _ANSWER_Y_OFF - _SPRITE_Y0) // _ARROW_STEP
     return steps_x, steps_y
 
 
 class PuzzleSolver:
-    """Bir Playwright sayfasına bağlanıp puzzle CAPTCHA'yı çözer.
+    """Attaches to a Playwright page and solves the puzzle CAPTCHA.
 
-    Kullanım:
+    Usage:
         solver = PuzzleSolver()
-        await solver.attach(page)      # goto'dan ÖNCE — ağ dinleyicileri kurar
-        ...                            # login formunu doldur
-        await solver.solve(page)       # CAPTCHA çıktıysa çöz
+        await solver.attach(page)      # BEFORE goto — installs net listeners
+        ...                            # fill in the login form
+        await solver.solve(page)       # solve the CAPTCHA if one appeared
     """
 
     def __init__(self, pow_workers=None):
@@ -159,11 +176,13 @@ class PuzzleSolver:
         self._pow_workers = pow_workers
 
     async def attach(self, page):
-        """Ağ dinleyicilerini kur. Sayfa yüklenmeden ÖNCE çağrılmalı.
+        """Install the network listeners. MUST be called BEFORE the page loads.
 
-        `bg` ve `init` yanıtları yakalanır; `validate` isteğine çözülmüş PoW
-        cevapları enjekte edilir. Koordinatlar tarayıcının kendi hesabıdır —
-        yalnızca `answers` alanı değiştirilir.
+        The `bg` and `init` responses fly past while the page is loading, so
+        the listeners have to be in place beforehand. They capture those two
+        responses, and the solved PoW answers are injected into the `validate`
+        request. The coordinates are the browser's own computation — only the
+        `answers` field is modified.
         """
         async def on_response(resp):
             try:
@@ -176,7 +195,7 @@ class PuzzleSolver:
                     log.info("CAPTCHA init: %d challenges, %d leading zeros",
                              len(self.init_data.get("challenges", [])),
                              self.init_data.get("nLeadingZerosRequired", 0))
-            except Exception as e:  # noqa: BLE001 — dinleyici asla patlamamalı
+            except Exception as e:  # noqa: BLE001 — a listener must never blow up
                 log.debug("CAPTCHA response handler: %s", e)
 
         async def on_validate(route):
@@ -200,10 +219,11 @@ class PuzzleSolver:
 
     @staticmethod
     async def has_iframe(page):
-        """CAPTCHA iframe'i şu anda var mı? Beklemez.
+        """Is a CAPTCHA iframe present right now? Does not wait.
 
-        Çağıran kendi bekleme döngüsünü yürütürken kullanılır: login sonrası
-        cookie de captcha da gelebilir, hangisi önce gelirse ona tepki verilir.
+        Used while the caller runs its own wait loop: after login either the
+        cookie or the CAPTCHA may arrive, and whichever comes first is the one
+        reacted to.
         """
         for frame in await page.locator("iframe").all():
             title = await frame.get_attribute("title")
@@ -213,20 +233,21 @@ class PuzzleSolver:
 
     @classmethod
     async def is_present(cls, page, timeout=15):
-        """CAPTCHA iframe'i belirene kadar bekle. Yoksa False."""
+        """Wait until the CAPTCHA iframe appears. False if there is none."""
         for _ in range(timeout):
             if await cls.has_iframe(page):
                 return True
             await asyncio.sleep(1)
         return False
 
-    # Teşhis çıktıları. Puzzle yanlış yere sürüklendiğinde tek anlamlı kanıt
-    # bunlar: ham arka plan ve tespit edilen deliğin işaretlenmiş hali.
+    # Diagnostic dumps. When the puzzle gets dragged to the wrong place these
+    # are the only meaningful evidence: the raw background and the detected
+    # hole marked on it.
     DEBUG_BG = "/tmp/proton-captcha-bg.png"
     DEBUG_MARKED = "/tmp/proton-captcha-detected.png"
 
     def _dump_debug(self, answer_x, answer_y):
-        """Arka planı ve bulunan deliği diske yaz (hata ayıklama)."""
+        """Write the background and the detected hole to disk (debugging)."""
         try:
             import cv2
             import numpy as np
@@ -235,7 +256,7 @@ class PuzzleSolver:
                 f.write(self.bg_bytes)
             img = cv2.imdecode(np.frombuffer(self.bg_bytes, np.uint8),
                                cv2.IMREAD_COLOR)
-            # answer → delik merkezi (find_hole'un tersi)
+            # answer → hole centre (the inverse of find_hole)
             cx = answer_x + _ANSWER_X_OFF
             cy = answer_y + _ANSWER_Y_OFF - _BG_Y_OFF
             cv2.drawMarker(img, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 40, 2)
@@ -243,17 +264,17 @@ class PuzzleSolver:
             cv2.imwrite(self.DEBUG_MARKED, img)
             log.info("CAPTCHA debug images: %s (raw), %s (detected hole at %d,%d)",
                      self.DEBUG_BG, self.DEBUG_MARKED, cx, cy)
-        except Exception as e:  # noqa: BLE001 — teşhis asla akışı bozmamalı
+        except Exception as e:  # noqa: BLE001 — diagnostics must never break flow
             log.debug("CAPTCHA debug dump failed: %s", e)
 
     async def solve(self, page, timeout=30):
-        """CAPTCHA belirene kadar bekle, çık(tıy)sa çöz.
+        """Wait until the CAPTCHA appears and solve it if it did.
 
         Returns:
-            bool: Çözüldüyse True, CAPTCHA hiç çıkmadıysa False.
+            bool: True if solved, False if no CAPTCHA ever appeared.
 
         Raises:
-            CaptchaError: CAPTCHA var ama çözülemedi.
+            CaptchaError: A CAPTCHA is present but could not be solved.
         """
         if not await self.is_present(page, timeout=timeout):
             log.debug("No CAPTCHA present")
@@ -261,25 +282,25 @@ class PuzzleSolver:
         return await self.solve_now(page, timeout=timeout)
 
     async def solve_now(self, page, timeout=30):
-        """CAPTCHA'yı hemen çöz — iframe'in zaten var olduğu varsayılır.
+        """Solve the CAPTCHA right away — the iframe is assumed to exist.
 
-        Çağıran kendi bekleme döngüsünü yürütüyorsa bu kullanılır; `solve`
-        iframe'i beklemek için fazladan tur harcar.
+        This is what a caller running its own wait loop uses; `solve` spends
+        extra rounds waiting for the iframe.
         """
 
-        # init ve bg ağ yanıtlarını bekle
+        # wait for the init and bg network responses
         for _ in range(timeout * 2):
             if self.init_data and self.bg_bytes:
                 break
             await asyncio.sleep(0.5)
         if not self.init_data:
             raise CaptchaError(
-                "CAPTCHA init verisi alınamadı — Proton akışı değişmiş olabilir"
+                "CAPTCHA init data never arrived; Proton's flow may have changed"
             )
         if not self.bg_bytes:
-            raise CaptchaError("CAPTCHA arka plan görseli alınamadı")
+            raise CaptchaError("CAPTCHA background image never arrived")
 
-        # PoW — validate isteği gelmeden hazır olmalı
+        # PoW — must be ready before the validate request goes out
         loop = asyncio.get_running_loop()
         self.answers = await loop.run_in_executor(
             None, solve_pow,
@@ -292,7 +313,7 @@ class PuzzleSolver:
         try:
             answer_x, answer_y = find_hole(self.bg_bytes)
         except CaptchaError:
-            # Delik bulunamadı — ham arka planı bırak, gözle bakılabilsin.
+            # Hole not found — dump the raw background so it can be eyeballed.
             self._dump_debug(_ANSWER_X_OFF, _ANSWER_Y_OFF - _BG_Y_OFF)
             raise
         self._dump_debug(answer_x, answer_y)
@@ -302,10 +323,10 @@ class PuzzleSolver:
             (f for f in page.frames if "captcha/v1/assets" in f.url), None
         )
         if frame is None:
-            raise CaptchaError("CAPTCHA assets frame bulunamadı")
+            raise CaptchaError("CAPTCHA assets frame not found")
 
-        # Canvas'a odaklan, parçayı ok tuşlarıyla taşı. Fare sürüklemesi
-        # yerine ok tuşu: son koordinatı tarayıcı hesaplar.
+        # Focus the canvas, move the piece with the arrow keys. Arrow keys
+        # instead of a mouse drag: the browser computes the final coordinate.
         await frame.locator("canvas").click()
         await page.wait_for_timeout(300)
         for _ in range(abs(steps_x)):
@@ -316,7 +337,7 @@ class PuzzleSolver:
                  steps_x, steps_y)
         await page.wait_for_timeout(300)
 
-        # "Next" etkinleşene kadar bekle ve tıkla
+        # wait until "Next" becomes enabled and click it
         for _ in range(15):
             btn = frame.locator("button.btn-solid-purple")
             if await btn.count() > 0 and await btn.get_attribute("disabled") is None:
@@ -324,4 +345,4 @@ class PuzzleSolver:
                 log.info("CAPTCHA submitted")
                 return True
             await asyncio.sleep(1)
-        raise CaptchaError("CAPTCHA 'Next' butonu etkinleşmedi")
+        raise CaptchaError("CAPTCHA 'Next' button never became enabled")

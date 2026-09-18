@@ -611,7 +611,7 @@ def test_login_replaces_a_stale_session(tmp_path, monkeypatch):
 
 def test_srp_login_without_a_password_fails_before_any_request(client):
     client.password = ""
-    with pytest.raises(RuntimeError, match="Şifre yok"):
+    with pytest.raises(RuntimeError, match="No password available"):
         client._srp_authenticate()
 
 
@@ -622,7 +622,7 @@ np = pytest.importorskip("numpy")
 
 
 def _puzzle_bg(hole_center, size=(370, 320)):
-    """Proton'un puzzle arka planını taklit et: beyaz konturlu koyu delik."""
+    """Mimic Proton's puzzle background: a dark hole with a white outline."""
     h, w = size
     img = np.zeros((h, w, 3), np.uint8)
     cv2.ellipse(img, (w // 2, h // 3), (120, 60), 20, 0, 360, (200, 230, 210), -1)
@@ -649,14 +649,14 @@ def test_find_hole_raises_instead_of_guessing_zero():
     from proton_mail_api.captcha import CaptchaError, find_hole
 
     flat = cv2.imencode(".png", np.full((200, 200, 3), 128, np.uint8))[1].tobytes()
-    with pytest.raises(CaptchaError, match="bulunamadı"):
+    with pytest.raises(CaptchaError, match="not found"):
         find_hole(flat)
 
 
 def test_find_hole_rejects_a_corrupt_image():
     from proton_mail_api.captcha import CaptchaError, find_hole
 
-    with pytest.raises(CaptchaError, match="çözümlenemedi"):
+    with pytest.raises(CaptchaError, match="could not be decoded"):
         find_hole(b"not-an-image")
 
 
@@ -1000,7 +1000,7 @@ def test_a_rejected_key_registration_stores_nothing(client, monkeypatch):
     """A half-created address must not leave an unusable key behind."""
     _stub_create_address(client, monkeypatch, keys_code=2001)
 
-    with pytest.raises(RuntimeError, match="Key kayıt hatası"):
+    with pytest.raises(RuntimeError, match="Key registration failed"):
         client.create_address("doomed")
 
     assert "doomed@proton.me" not in client.config.get("address_keys", {})

@@ -37,15 +37,15 @@ UA = "Mozilla/5.0 (X11; Linux x86_64; rv:153.0) Gecko/20100101 Firefox/153.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# Proton'un insan doğrulaması istediğini bildiren API hata kodu.
+# API error code Proton returns when it wants human verification.
 HV_REQUIRED_CODE = 9001
 
 
 class HumanVerificationRequired(RuntimeError):
-    """Proton login için CAPTCHA/insan doğrulaması istiyor.
+    """Proton wants CAPTCHA/human verification for login.
 
-    Şifrenin yanlış olmasından ayrı tutulur: çağıran tarayıcıya düşüp
-    puzzle'ı çözebilir, ama yanlış şifreyi tekrar denemenin anlamı yok.
+    Kept separate from a wrong password: the caller can fall back to a
+    browser and solve the puzzle, but retrying a wrong password is pointless.
     """
 
     def __init__(self, message, details=None):
@@ -80,16 +80,18 @@ class ProtonReader:
             config_path = os.path.join(os.getcwd(), config_path)
         self.config_path = config_path
         self._load_config()
-        # reentrant: _api → refresh → _api zincirinde deadlock olmasın
+        # reentrant: avoid deadlock in the _api -> refresh -> _api chain
         self._refresh_lock = threading.RLock()
         self._last_refresh_time = 0
         self._last_browser_login_time = 0
-        # Adres listesi cache'i — Proton /addresses page 1 ~9s sürüyor, adresler nadir değişir
+        # Address list cache — Proton /addresses page 1 takes ~9s, and
+        # addresses rarely change
         self._addr_cache = None
         self._addr_cache_time = 0
-        self._addr_cache_ttl = 300  # 5 dk
-        # Tek httpx.Client — her istekte yeni Client açmak socket sızdırır.
-        # Header/cookie'ler token yenilenince _sync_client_auth() ile güncellenir.
+        self._addr_cache_ttl = 300  # 5 min
+        # Single httpx.Client — opening a new Client per request leaks sockets.
+        # Headers/cookies are refreshed via _sync_client_auth() when the token
+        # is renewed.
         self._http = httpx.Client(
             base_url="https://mail.proton.me/api",
             follow_redirects=False,
@@ -98,7 +100,7 @@ class ProtonReader:
         self._sync_client_auth()
 
     def close(self):
-        """HTTP bağlantılarını kapat."""
+        """Close HTTP connections."""
         self._http.close()
 
     def __enter__(self):
@@ -108,10 +110,10 @@ class ProtonReader:
         self.close()
 
     def _load_config(self):
-        """Config'i yükle.
+        """Load the config.
 
-        uid/auth_token ZORUNLU DEĞİL: yalnızca email+password içeren bir config
-        geçerlidir, oturum login() ile SRP üzerinden açılır.
+        uid/auth_token are NOT REQUIRED: a config with only email+password is
+        valid, and the session is opened through SRP via login().
         """
         with open(self.config_path) as f:
             self.config = json.load(f)
@@ -127,19 +129,21 @@ class ProtonReader:
             )
 
     def _save_config(self):
-        """Config'i atomik ve 0600 izinle yaz.
+        """Write the config atomically with 0600 permissions.
 
-        Doğrudan open(path, "w") yazmak dosyayı önce truncate eder; aynı config'e
-        paralel refresh yapan ikinci bir süreç/thread araya girerse parola, token
-        ve PGP private key'lerin tamamı kalıcı olarak kaybolur. Bu yüzden aynı
-        dizine geçici dosya yazılıp os.replace ile atomik takas edilir.
+        Writing straight with open(path, "w") truncates the file first; if a
+        second process/thread refreshing the same config slips in between, the
+        password, tokens and all PGP private keys are lost permanently. That is
+        why a temp file is written in the same directory and swapped in
+        atomically with os.replace.
         """
         directory = os.path.dirname(self.config_path) or "."
         fd, tmp_path = tempfile.mkstemp(
             dir=directory, prefix=".proton-config-", suffix=".tmp"
         )
         try:
-            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0600 — sırlar dünyaya açık olmasın
+            # 0600 — do not expose secrets to the world
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
             with os.fdopen(fd, "w") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
                 f.flush()
@@ -168,35 +172,37 @@ class ProtonReader:
         return cookies
 
     def _sync_client_auth(self):
-        """Paylaşılan client'ın header/cookie'lerini config ile hizala."""
+        """Align the shared client's headers/cookies with the config."""
         self._http.headers.update(self._headers())
         self._http.cookies.clear()
         for name, val in self._cookie_jar().items():
             self._http.cookies.set(name, val)
 
-    # Hesabın planından gelen scope'lar. Bunlar oturumun kilitli olmasından
-    # değil, planın o özelliği hiç içermemesinden eksiktir; yeniden login
-    # etmek döndürmez. (Ücretsiz hesapta alias için "organization" böyle.)
+    # Scopes that come from the account's plan. These are missing not because
+    # the session is locked but because the plan never includes that feature;
+    # logging in again will not grant them. (On a free account "organization"
+    # for aliases behaves exactly like this.)
     _PLAN_SCOPES = frozenset({
         "organization", "vpn", "drive", "pass", "wallet", "docs", "meet",
     })
 
     def _api(self, path, method="GET", _retry=0, **kwargs):
-        """API isteği yap. 401/403/429/5xx otomatik handle eder."""
+        """Make an API request. Handles 401/403/429/5xx automatically."""
         try:
             r = self._http.request(method.upper(), path, **kwargs)
         except httpx.HTTPError:
-            # Connection hatası — retry
+            # Connection error — retry
             if _retry < 2:
                 time.sleep(2)
                 return self._api(path, method=method, _retry=_retry + 1, **kwargs)
             raise
 
-        # 401 — Token expired → refresh dene
+        # 401 — token expired -> try refresh
         if r.status_code == 401 and _retry < 2:
             now = time.time()
             with self._refresh_lock:
-                # 60sn içinde refresh yapıldıysa tekrar deneme — yeni token zaten var
+                # Skip retrying if a refresh happened within 60s — the new
+                # token is already in place
                 if now - self._last_refresh_time < 60:
                     log.debug("Token recently refreshed (cooldown); retrying request")
                     self._sync_client_auth()
@@ -206,17 +212,19 @@ class ProtonReader:
                     try:
                         self.refresh()
                     except (RuntimeError, OSError, ValueError, httpx.HTTPError) as e:
-                        # REFRESH token da bozuksa browser login (cooldown ile)
+                        # If the REFRESH token is broken too, fall back to a
+                        # browser login (with cooldown)
                         log.warning("Token refresh failed (%s); trying browser login", e)
                         self._browser_relogin()
             return self._api(path, method=method, _retry=_retry + 1, **kwargs)
 
-        # 403 — Scope yetersiz. İki ayrı sebep var ve yalnızca biri
-        # login'le düzelir:
-        #   * oturum kilitli/kısıtlı (scope: locked) → taze login yardım eder;
-        #   * istenen scope hesabın PLANINDA yok (ör. organization: ücretsiz
-        #     hesapta hiç verilmez) → yeniden login aynı 403'ü döndürür,
-        #     tarayıcı açmak saf israftır.
+        # 403 — insufficient scope. There are two distinct causes and only one
+        # of them is fixed by logging in:
+        #   * the session is locked/restricted (scope: locked) -> a fresh login
+        #     helps;
+        #   * the requested scope is absent from the account's PLAN (e.g.
+        #     organization is never granted on a free account) -> logging in
+        #     again returns the same 403, and opening a browser is pure waste.
         if r.status_code == 403 and _retry < 1:
             err_text = r.text
             if "scope" in err_text.lower() or "MissingScopes" in err_text:
@@ -235,13 +243,15 @@ class ProtonReader:
                     )
                 else:
                     log.info("Insufficient scope; attempting browser login")
-                    # Cooldown'a takılırsa retry etmek anlamsız — aynı 403 döner.
+                    # Retrying is pointless if the cooldown blocks it — the
+                    # same 403 comes back.
                     if self._browser_relogin():
                         return self._api(path, method=method,
                                          _retry=_retry + 1, **kwargs)
 
-        # 429 — Rate limited → bekle ve retry. Retry hakkı kalmadıysa beklemeden
-        # hata atılır; boşa uyumak çağıranı gereksiz bloke eder.
+        # 429 — rate limited -> wait and retry. When no retries are left the
+        # error is raised without waiting; sleeping for nothing would block the
+        # caller needlessly.
         if r.status_code == 429 and _retry < 3:
             try:
                 retry_after = int(r.headers.get("Retry-After", "10"))
@@ -252,7 +262,7 @@ class ProtonReader:
             time.sleep(retry_after)
             return self._api(path, method=method, _retry=_retry + 1, **kwargs)
 
-        # 5xx — Sunucu hatası → retry
+        # 5xx — server error -> retry
         if r.status_code >= 500 and _retry < 2:
             time.sleep(3)
             return self._api(path, method=method, _retry=_retry + 1, **kwargs)
@@ -263,22 +273,23 @@ class ProtonReader:
 
     def _browser_login_with_captcha(self, timeout=180, headless=None,
                                     slow_mo=0, keep_open=0):
-        """Tarayıcıda login ol, puzzle CAPTCHA'yı otomatik çöz, oturumu al.
+        """Log in through a browser, auto-solve the puzzle CAPTCHA, grab the
+        session.
 
-        SRP HTTP yolu insan doğrulaması istediğinde kullanılır. CAPTCHA
-        tarayıcı içinde çözülmek zorunda: doğrulama isteği canvas üzerinde
-        hesaplanan koordinatları ve `pcaptcha` header'ını taşıyor.
+        Used when the SRP HTTP path asks for human verification. The CAPTCHA
+        must be solved inside a browser: the verification request carries
+        coordinates computed on the canvas plus the `pcaptcha` header.
 
         Requires: pip install proton-mail-api[captcha]
 
         Args:
-            headless: None ise PROTON_HEADLESS ortam değişkenine bakar
-                      ("0" → görünür). Görünür mod hata ayıklama içindir:
-                      puzzle'ın nerede patladığı ancak izlenerek görülür.
-            slow_mo: Her Playwright eyleminden sonra beklenecek ms. Görünür
-                     modda 250-500 arası izlemeyi kolaylaştırır.
-            keep_open: Hata durumunda tarayıcıyı kapatmadan önce beklenecek
-                       saniye. Görünür modda son ekranı incelemek için.
+            headless: When None, the PROTON_HEADLESS environment variable is
+                      used ("0" -> visible). Visible mode is for debugging:
+                      where the puzzle blows up can only be seen by watching.
+            slow_mo: Milliseconds to wait after every Playwright action. In
+                     visible mode 250-500 makes it easier to follow.
+            keep_open: Seconds to wait before closing the browser on failure.
+                       For inspecting the last screen in visible mode.
         """
         import asyncio
 
@@ -310,21 +321,21 @@ class ProtonReader:
                 try:
                     ctx = await browser.new_context(user_agent=UA)
                     page = await ctx.new_page()
-                    # Tarayıcı içi hatalar sessizce yutulmasın — puzzle'ın
-                    # neden patladığı genelde burada görünür.
+                    # Do not silently swallow in-browser errors — why the
+                    # puzzle broke is usually visible here.
                     page.on("console", lambda m: log.debug("browser console [%s]: %s",
                                                            m.type, m.text))
                     page.on("pageerror", lambda e: log.warning("browser error: %s", e))
 
                     solver = PuzzleSolver()
-                    # Dinleyiciler goto'dan ÖNCE kurulmalı: init/bg yanıtları
-                    # sayfa yüklenirken geçiyor.
+                    # Listeners must be installed BEFORE goto: the init/bg
+                    # responses go by while the page is loading.
                     await solver.attach(page)
 
-                    # Login'in gerçek verdikti /core/v4/auth yanıtıdır.
-                    # Proton YANLIŞ şifrede de AUTH-<uid> cookie'si yazar
-                    # (pre-auth session), bu yüzden cookie varlığı başarı
-                    # kanıtı DEĞİLDİR: Code 1000 aranır.
+                    # The real verdict for the login is the /core/v4/auth
+                    # response. Proton writes an AUTH-<uid> cookie even for a
+                    # WRONG password (pre-auth session), so the presence of the
+                    # cookie is NOT proof of success: look for Code 1000.
                     verdict = {}
 
                     async def on_auth(resp):
@@ -333,8 +344,9 @@ class ProtonReader:
                         try:
                             body = await resp.json()
                         except (ValueError, PlaywrightError):
-                            # Gövde JSON değil ya da yanıt artık okunamıyor
-                            # (sayfa gitti). Verdict'i bozmadan geç.
+                            # The body is not JSON, or the response can no
+                            # longer be read (the page is gone). Move on
+                            # without corrupting the verdict.
                             return
                         if isinstance(body, dict) and "Code" in body:
                             verdict.clear()
@@ -344,24 +356,26 @@ class ProtonReader:
 
                     await page.goto("https://account.proton.me/login",
                                     timeout=60_000)
-                    # Proton Account bir SPA: goto dönse bile ekranda hâlâ
-                    # "Loading Proton Account.." olabilir ve form DOM'da yoktur.
-                    # Sabit sleep yerine alanın kendisini bekle.
+                    # Proton Account is an SPA: even after goto returns, the
+                    # screen may still show "Loading Proton Account.." and the
+                    # form is absent from the DOM. Wait for the field itself
+                    # instead of a fixed sleep.
                     await page.wait_for_selector('input[id="username"]',
                                                  timeout=60_000)
                     await page.fill('input[id="username"]', username)
                     await page.fill('input[id="password"]', self.password)
                     await page.locator('button[type="submit"]').click()
 
-                    # Tek bekleme döngüsü: verdict, CAPTCHA ve 2FA aynı anda
-                    # izlenir; hangisi önce gelirse ona tepki verilir. CAPTCHA
-                    # her zaman gelmez, o yüzden onu ayrıca beklemek yanlış.
+                    # A single wait loop: the verdict, the CAPTCHA and 2FA are
+                    # watched at the same time and whichever arrives first is
+                    # acted on. The CAPTCHA does not always appear, so waiting
+                    # for it separately would be wrong.
                     uid = access = refresh = None
                     captcha_done = False
 
                     def read_tokens(jar, want_uid):
-                        """Token'ları doğrulanmış UID'e bağla, herhangi bir
-                        AUTH- cookie'sine değil."""
+                        """Bind the tokens to the verified UID, not to any
+                        arbitrary AUTH- cookie."""
                         a = r = None
                         for c in jar:
                             name, value = c.get("name", ""), c.get("value", "")
@@ -394,8 +408,9 @@ class ProtonReader:
                                 f"{verdict.get('Error') or verdict}"
                             )
 
-                        # CAPTCHA çıktıysa çöz; çözümden sonra Proton yeni bir
-                        # /auth isteği yapar, o yüzden eski verdikti at.
+                        # If a CAPTCHA showed up, solve it; after solving,
+                        # Proton issues a new /auth request, so drop the old
+                        # verdict.
                         if not captcha_done and await solver.has_iframe(page):
                             log.info("CAPTCHA appeared; solving")
                             await solver.solve_now(page)
@@ -403,7 +418,7 @@ class ProtonReader:
                             verdict.clear()
                             continue
 
-                        # 2FA ekranı geldiyse beklemenin anlamı yok.
+                        # Once the 2FA screen appears there is no point waiting.
                         if await page.locator(
                             'input[id="twoFa"], input[name="totp"]'
                         ).count():
@@ -423,7 +438,8 @@ class ProtonReader:
                              captcha_done, verdict.get("Scope", "")[:40])
                     return uid, access, refresh
                 except Exception as e:
-                    # Teşhis: ekran görüntüsü + son URL. Hatayı yutmadan zenginleştir.
+                    # Diagnostics: screenshot + last URL. Enrich the error
+                    # without swallowing it.
                     if page is not None:
                         shot = "/tmp/proton-login-failed.png"
                         try:
@@ -450,18 +466,19 @@ class ProtonReader:
         log.info("CAPTCHA login succeeded for %s", self.email)
         return True
 
-    _BROWSER_LOGIN_COOLDOWN = 120  # sn
+    _BROWSER_LOGIN_COOLDOWN = 120  # seconds
 
     def _browser_relogin(self):
-        """Browser ile login yapıp taze token al (tüm scope'larla).
+        """Log in through a browser and get fresh tokens (with all scopes).
 
-        Cooldown burada zorunlu tutulur: her çağrı yeni bir headless Chromium
-        başlatır, ve 401/403 merdiveni her istekte buraya düşebilir. Cooldown
-        çağrı yerine bırakılırsa tek bir yetkisiz token istek başına bir tarayıcı
-        açtırır.
+        The cooldown is enforced here: every call starts a new headless
+        Chromium, and the 401/403 ladder can fall through to this point on
+        every request. If the cooldown were left to the call site, a single
+        unauthorized token would open one browser per request.
 
         Returns:
-            bool: Login denendiyse True, cooldown nedeniyle atlandıysa False.
+            bool: True if a login was attempted, False if it was skipped
+                  because of the cooldown.
         """
         with self._refresh_lock:
             now = time.time()
@@ -519,7 +536,7 @@ class ProtonReader:
 
                         await page.goto("https://account.proton.me/login",
                                         timeout=60_000)
-                        # SPA: sabit sleep yavaş bağlantıda formu ıskalar.
+                        # SPA: a fixed sleep misses the form on a slow link.
                         await page.wait_for_selector('input[id="username"]',
                                                      timeout=60_000)
                         await page.fill('input[id="username"]', username)
@@ -571,17 +588,17 @@ class ProtonReader:
                      self.email, scope[:60])
             return True
 
-    # ── Token refresh ────────────��───────────────────────────────────────
+    # ── Token refresh ────────────────────────────────────────────────
 
     def refresh(self):
-        """REFRESH cookie ile yeni AUTH token al. Lock ile korunur.
+        """Get a new AUTH token with the REFRESH cookie. Guarded by a lock.
 
-        Not: Proton WebAccount/WebMail refresh'i yeni token'ları JSON body'de
-        DEĞİL, Set-Cookie header'ında döner (AUTH-<uid>, REFRESH-<uid>,
-        Session-Id, Tag). UID de değişir (RefreshCounter artar).
+        Note: Proton's WebAccount/WebMail refresh returns the new tokens in the
+        Set-Cookie header, NOT in the JSON body (AUTH-<uid>, REFRESH-<uid>,
+        Session-Id, Tag). The UID changes as well (RefreshCounter increments).
         """
         with self._refresh_lock:
-            # REFRESH cookie'yi bul
+            # Find the REFRESH cookie
             cookies = self.config.get("cookies", {})
 
             refresh_payload = None
@@ -592,7 +609,8 @@ class ProtonReader:
                 try:
                     refresh_payload = json.loads(unquote(raw))
                 except (ValueError, TypeError):
-                    # Cookie ham refresh token'ı taşıyor (URL-encoded JSON değil)
+                    # The cookie carries the raw refresh token (not
+                    # URL-encoded JSON)
                     refresh_payload = {
                         "ResponseType": "token",
                         "ClientID": "WebMail",
@@ -604,17 +622,20 @@ class ProtonReader:
 
             if not refresh_payload:
                 raise RuntimeError(
-                    "REFRESH cookie bulunamadı. Config'e REFRESH-{uid} cookie'si ekleyin."
+                    "REFRESH cookie not found. Add the REFRESH-{uid} cookie "
+                    "to the config."
                 )
 
-            # ClientID'ye uygun appversion seç (WebAccount → web-account, aksi WebMail)
+            # Pick the appversion matching the ClientID
+            # (WebAccount -> web-account, otherwise WebMail)
             client_id = refresh_payload.get("ClientID", "WebMail")
             if client_id == "WebAccount":
                 refresh_appversion = "web-account@5.0.999.0"
             else:
                 refresh_appversion = APP_VERSION
 
-            # Session cookie'lerini de gönder (refresh endpoint Session-Id ister)
+            # Send the session cookies too (the refresh endpoint wants
+            # Session-Id)
             refresh_cookies = {}
             for name, val in self.config.get("cookies", {}).items():
                 if isinstance(val, str):
@@ -637,13 +658,14 @@ class ProtonReader:
 
             data = r.json()
             if r.status_code != 200 or data.get("Code") != 1000:
-                raise RuntimeError(f"Token yenileme başarısız: {data}")
+                raise RuntimeError(f"Token refresh failed: {data}")
 
-            # Yeni token'ları Set-Cookie header'ından çek
+            # Pull the new tokens out of the Set-Cookie header
             new_uid = data.get("UID", self.uid)
             resp_cookies = {c.name: c.value for c in r.cookies.jar}
 
-            new_access = data.get("AccessToken")  # bazı client'larda body'de de olabilir
+            # some clients also put it in the body
+            new_access = data.get("AccessToken")
             new_refresh = data.get("RefreshToken")
 
             for cname, cval in resp_cookies.items():
@@ -651,26 +673,27 @@ class ProtonReader:
                     new_access = cval
                     new_uid = cname[len("AUTH-"):]
                 elif cname.startswith("REFRESH-"):
-                    # REFRESH cookie value = URL-encoded JSON; içinden RefreshToken çıkar
+                    # REFRESH cookie value = URL-encoded JSON; extract
+                    # RefreshToken from it
                     try:
                         rj = json.loads(unquote(cval or ""))
                         new_refresh = rj.get("RefreshToken", new_refresh)
                     except (ValueError, TypeError):
-                        # Ham refresh token — JSON sarmalayıcı yok
+                        # Raw refresh token — no JSON envelope
                         new_refresh = cval
 
             if not new_access:
                 raise RuntimeError(
-                    f"Token yenileme: yeni AUTH token bulunamadı "
+                    f"Token refresh: new AUTH token not found "
                     f"(cookies={list(resp_cookies.keys())})"
                 )
 
-            # auth_token güncelle
+            # Update auth_token
             self.auth_token = new_access
             self.config["auth_token"] = new_access
             auth_key = f"AUTH-{new_uid}"
 
-            # Eski AUTH/REFRESH cookie'lerini temizle, yenilerini yaz
+            # Drop the old AUTH/REFRESH cookies, write the new ones
             from urllib.parse import quote
             cfg_cookies = self.config.setdefault("cookies", {})
             for old_key in [k for k in cfg_cookies
@@ -688,7 +711,7 @@ class ProtonReader:
                 })
                 cfg_cookies[f"REFRESH-{new_uid}"] = quote(new_refresh_val)
 
-            # Session-Id / Tag güncelle (varsa)
+            # Update Session-Id / Tag (when present)
             for cname in ("Session-Id", "Tag"):
                 if cname in resp_cookies:
                     cfg_cookies[cname] = resp_cookies[cname]
@@ -704,14 +727,16 @@ class ProtonReader:
             log.info("Auth token refreshed for %s", self.email)
             return True
 
-    # ── Setup: API'den key bilgilerini çek ────────────────────────────
+    # ── Setup: fetch key info from API ───────────────────────────────
 
     def setup(self):
-        """API'den PrimaryKey, Address keys çek ve config'e yaz.
-        KeySalt için keys/salts endpoint'i lazım — eğer 403 alırsa
-        key_salt'ı elle girmek gerekir veya SRP login ile çekilir."""
+        """Fetch PrimaryKey and address keys from the API and write them to the
+        config.
 
-        # 1. User → PrimaryKey
+        KeySalt needs the keys/salts endpoint — on a 403 the key_salt has to be
+        entered by hand, or it is fetched through an SRP login."""
+
+        # 1. User -> PrimaryKey
         user_data = self._api("/core/v4/users")
         user = user_data["User"]
         user_keys = user.get("Keys", [])
@@ -720,7 +745,7 @@ class ProtonReader:
         if primary_key:
             self.config["primary_key"] = primary_key
 
-        # 2. KeySalt dene (403 olabilir — scope: locked)
+        # 2. Try KeySalt (may 403 — scope: locked)
         try:
             salts_data = self._api("/core/v4/keys/salts")
             key_salt = salts_data.get("KeySalts", [{}])[0].get("KeySalt")
@@ -730,7 +755,7 @@ class ProtonReader:
                 log.info("KeySalt fetched from keys/salts")
         except (RuntimeError, httpx.HTTPError) as e:
             log.warning("KeySalt fetch failed (scope:locked?): %s; trying SRP login", e)
-            # SRP login ile KeySalt çekmeyi dene
+            # Try fetching the KeySalt through an SRP login
             try:
                 key_salt = self._srp_get_key_salt()
                 if key_salt:
@@ -740,7 +765,7 @@ class ProtonReader:
             except (RuntimeError, ImportError, KeyError, httpx.HTTPError) as e2:
                 log.warning("SRP KeySalt fetch failed: %s", e2)
 
-        # 3. Addresses → Address keys (tüm sayfalar)
+        # 3. Addresses -> address keys (all pages)
         addr_keys = {}
         for addr in self._fetch_addresses_raw(with_keys=True):
             email = addr["Email"]
@@ -764,22 +789,23 @@ class ProtonReader:
         }
 
     def login(self, allow_captcha=True, headless=None, slow_mo=0, keep_open=0):
-        """E-posta + şifre ile login yap, oturumu config'e yaz.
+        """Log in with email + password and write the session to the config.
 
-        Önce saf HTTP SRP denenir (hızlı, tarayıcı gerekmez). Proton insan
-        doğrulaması isterse (HV / 9001) tarayıcıya düşülür ve puzzle CAPTCHA
-        otomatik çözülür.
+        Plain HTTP SRP is tried first (fast, no browser needed). If Proton asks
+        for human verification (HV / 9001), the flow falls back to a browser and
+        the puzzle CAPTCHA is solved automatically.
 
         Requires: pip install proton-mail-api[srp]
-                  CAPTCHA fallback için ayrıca: proton-mail-api[captcha]
+                  for the CAPTCHA fallback also: proton-mail-api[captcha]
 
         Args:
-            allow_captcha: False ise CAPTCHA istendiğinde tarayıcıya düşmez,
-                           hata verir. Başsız sunucuda kasıtlı kullanım için.
-            headless: CAPTCHA tarayıcısı gizli mi çalışsın. None → ortam
-                      değişkeni PROTON_HEADLESS ("0" → görünür).
-            slow_mo: Görünür modda eylem başına ms gecikme (izlemek için).
-            keep_open: Hata anında tarayıcıyı açık tutma süresi (sn).
+            allow_captcha: When False, no browser fallback happens if a CAPTCHA
+                           is requested; an error is raised instead. For
+                           deliberate use on a headless server.
+            headless: Whether the CAPTCHA browser runs hidden. None -> the
+                      PROTON_HEADLESS environment variable ("0" -> visible).
+            slow_mo: Per-action delay in ms in visible mode (for watching).
+            keep_open: How long to keep the browser open on failure (seconds).
 
         Returns:
             dict: {"uid", "email", "addresses", "key_salt": bool, "method"}
@@ -811,7 +837,7 @@ class ProtonReader:
         }
 
     def _store_session(self, uid, access_token, refresh_token=None):
-        """Yeni oturumu config'e yaz ve canlı client'ı hizala."""
+        """Write the new session to the config and align the live client."""
         self.uid = uid
         self.auth_token = access_token
         self.config["uid"] = uid
@@ -823,8 +849,9 @@ class ProtonReader:
         cookies[f"AUTH-{uid}"] = access_token
         if refresh_token:
             from urllib.parse import quote, unquote
-            # SRP ham RefreshToken verir; tarayıcı cookie'si ise zaten
-            # URL-encoded JSON zarfı taşır. İkinci kez sarmak refresh()'i bozar.
+            # SRP hands back a raw RefreshToken; the browser cookie, on the
+            # other hand, already carries a URL-encoded JSON envelope. Wrapping
+            # it a second time breaks refresh().
             try:
                 json.loads(unquote(refresh_token))
                 wrapped = refresh_token
@@ -842,22 +869,24 @@ class ProtonReader:
         self._sync_client_auth()
 
     def _srp_get_key_salt(self):
-        """SRP login yaparak KeySalt çek — keys/salts 403 verdiğinde."""
+        """Fetch the KeySalt via an SRP login — for when keys/salts 403s."""
         return self._srp_authenticate(fetch_key_salt=True)["key_salt"]
 
     def _srp_authenticate(self, fetch_key_salt=False):
-        """Proton SRP akışını yürüt.
+        """Run the Proton SRP flow.
 
         Requires: pip install proton-mail-api[srp]
 
         Args:
-            fetch_key_salt: True ise KeySalt da çekilir ve oturum kapatılır.
-                            False ise oturum AÇIK bırakılır (login() kullanır).
+            fetch_key_salt: When True the KeySalt is fetched as well and the
+                            session is closed. When False the session is left
+                            OPEN (login() relies on this).
         """
         if not self.password:
-            raise RuntimeError("Şifre yok — SRP login yapılamaz")
+            raise RuntimeError("No password available; cannot perform SRP login")
 
-        # SRP login gerekiyor — ağ isteğinden ÖNCE bağımlılıkları doğrula
+        # An SRP login is needed — validate the dependencies BEFORE any
+        # network request
         try:
             import gnupg
             from proton.constants import SRP_MODULUS_KEY
@@ -873,7 +902,8 @@ class ProtonReader:
         with httpx.Client(
             headers={"User-Agent": UA, "x-pm-appversion": APP_VERSION},
             base_url="https://mail.proton.me/api",
-            follow_redirects=False,  # Authorization header'ı redirect hedefine sızdırmasın
+            # do not leak the Authorization header to a redirect target
+            follow_redirects=False,
             timeout=30,
         ) as client:
             # 1. Auth info — salt, server challenge, modulus
@@ -882,12 +912,12 @@ class ProtonReader:
                 raise RuntimeError(f"auth/info: {info_resp.status_code}")
             info = info_resp.json()
 
-            # 2. Modulus imzasını DOĞRULA — sadece decrypt etmek yetmez.
-            # Modulus, SRP'nin grup parametresidir. Sunucu (veya araya giren
-            # biri) imzasız bir modulus verirse parola kanıtı kendi seçtiği
-            # gruba karşı üretilir ve SRP'nin garantisi çöker.
-            # python-gnupg imza geçersizse de veriyi döndürür; bu yüzden
-            # `valid` bayrağı açıkça kontrol edilmelidir.
+            # 2. VERIFY the modulus signature — decrypting alone is not enough.
+            # The modulus is SRP's group parameter. If the server (or someone
+            # in the middle) hands over an unsigned modulus, the password proof
+            # is derived against a group of their choosing and SRP's guarantee
+            # collapses. python-gnupg returns the data even when the signature
+            # is invalid, so the `valid` flag must be checked explicitly.
             gpg = gnupg.GPG()
             gpg.import_keys(SRP_MODULUS_KEY)
             verified = gpg.decrypt(info["Modulus"])
@@ -899,8 +929,8 @@ class ProtonReader:
                 )
             modulus = base64.b64decode(verified.data.strip())
 
-            # 3. İstemci kanıtı. process_challenge client proof (M) döndürür;
-            # ephemeral (A) get_challenge()'dan gelir.
+            # 3. Client proof. process_challenge returns the client proof (M);
+            # the ephemeral (A) comes from get_challenge().
             srp_user = SRPUser(self.password, modulus)
             client_ephemeral = srp_user.get_challenge()
             client_proof = srp_user.process_challenge(
@@ -919,8 +949,9 @@ class ProtonReader:
                 "SRPSession": info["SRPSession"],
             })
             if auth_resp.status_code != 200:
-                # HV, 422 + Code 9001 olarak gelir. Yanlış şifreden ayırt
-                # edilmeli: biri tarayıcıyla aşılabilir, diğeri aşılamaz.
+                # HV arrives as 422 + Code 9001. It must be distinguished from
+                # a wrong password: one can be cleared with a browser, the
+                # other cannot.
                 try:
                     err = auth_resp.json()
                 except ValueError:
@@ -937,8 +968,9 @@ class ProtonReader:
             if auth_data.get("Code") != 1000:
                 raise RuntimeError(f"auth rejected: {auth_data}")
 
-            # 5. Sunucunun kanıtını doğrula — karşı tarafın şifreyi gerçekten
-            # bildiğini kanıtlar. Atlanırsa sahte bir sunucu oturum verebilir.
+            # 5. Verify the server's proof — it proves the other side really
+            # knows the password. Skipping it would let a fake server hand out
+            # a session.
             srp_user.verify_session(base64.b64decode(auth_data["ServerProof"]))
             if not srp_user.authenticated():
                 raise RuntimeError("SRP server proof mismatch — aborting login")
@@ -949,14 +981,14 @@ class ProtonReader:
                     "without the TOTP code"
                 )
 
-            # 6. Token'lar. Proton WebMail akışı AccessToken'ı JSON gövdesinde
-            # DEĞİL, Set-Cookie header'ında döndürür (gövdede yalnızca Code,
-            # UID, ServerProof, Scope var). Gövdeye güvenmek KeyError verir;
-            # bu yüzden önce cookie jar'a, sonra gövdeye bakılır.
+            # 6. Tokens. The Proton WebMail flow returns the AccessToken in the
+            # Set-Cookie header, NOT in the JSON body (the body only has Code,
+            # UID, ServerProof, Scope). Trusting the body raises KeyError, so
+            # the cookie jar is consulted first and the body second.
             uid = auth_data["UID"]
-            # Token'lar doğrulanmış UID'e tam eşleşmeyle bağlanır. Prefix
-            # eşleşmesi, jar'da kalmış başka bir oturumun cookie'sini
-            # bağlayıp sessizce yanlış hesaba yazabilir.
+            # Tokens are bound to the verified UID by exact match. A prefix
+            # match could bind a cookie left over from another session in the
+            # jar and silently write it to the wrong account.
             jar = {c.name: c.value for c in auth_resp.cookies.jar}
             jar.update({c.name: c.value for c in client.cookies.jar})
             access = jar.get(f"AUTH-{uid}") or auth_data.get("AccessToken")
@@ -991,8 +1023,8 @@ class ProtonReader:
                 )
                 return result
             finally:
-                # Geçici SRP oturumunu kapat — açık kalırsa sunucuda
-                # kullanılmayan bir session birikir.
+                # Close the temporary SRP session — leaving it open piles up
+                # unused sessions on the server.
                 try:
                     client.delete("/core/v4/auth", headers=srp_headers)
                 except httpx.HTTPError as e:
@@ -1003,9 +1035,9 @@ class ProtonReader:
     def _derive_key_password(self):
         """password + key_salt → bcrypt → key_password"""
         if not self.password:
-            raise RuntimeError("Hesap şifresi config'te yok (password alanı)")
+            raise RuntimeError("Account password missing from config (password field)")
         if not self.key_salt:
-            raise RuntimeError("KeySalt config'te yok — önce setup() çalıştırın")
+            raise RuntimeError("KeySalt missing from config; run setup() first")
 
         key_salt_b64 = self.key_salt
         # Padding
@@ -1014,7 +1046,7 @@ class ProtonReader:
             key_salt_b64 += "=" * (4 - pad)
         salt_raw = base64.b64decode(key_salt_b64)
 
-        # Standard base64 → bcrypt base64 alfabe dönüşümü
+        # Standard base64 → bcrypt base64 alphabet conversion
         std = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
         bct = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
         table = bytes.maketrans(std, bct)
@@ -1027,8 +1059,8 @@ class ProtonReader:
     # ── Inbox ────────────────────────────────────────────────────────
 
     def inbox(self, page=0, size=20, unread_only=False, label_id=0):
-        """Inbox mesajlarını listele."""
-        size = max(1, min(int(size), 150))  # API üst sınırı
+        """List inbox messages."""
+        size = max(1, min(int(size), 150))  # API upper bound
         params = f"Page={int(page)}&PageSize={size}&LabelID={label_id}"
         if unread_only:
             params += "&Unread=1"
@@ -1049,21 +1081,22 @@ class ProtonReader:
             "time": m.get("Time", 0),
             "unread": m.get("Unread", 0) == 1,
             "size": m.get("Size", 0),
-            # Listeleme endpoint'i ToList/CCList'i zaten döndürür — ek çağrı gereksiz
+            # The listing endpoint already returns ToList/CCList — no extra
+            # call needed
             "to": [t.get("Address", "") for t in m.get("ToList", [])],
             "cc": [t.get("Address", "") for t in m.get("CCList", [])],
         }
 
     def search(self, query, size=50, max_pages=10, label_id=0):
-        """Konu/gönderen üzerinde arama — Proton'un kendi arama filtresiyle.
+        """Search over subject/sender — using Proton's own search filter.
 
-        Proton /mail/v4/messages, Keyword parametresiyle sunucu tarafında
-        subject/sender araması yapar. Eskiden sadece ilk sayfa yerelde
-        filtreleniyordu; ikinci sayfadaki eşleşmeler kaybediliyordu.
+        With the Keyword parameter, Proton /mail/v4/messages searches
+        subject/sender server-side. Previously only the first page was filtered
+        locally, so matches on the second page were lost.
 
         Args:
-            size: Döndürülecek maksimum mesaj sayısı.
-            max_pages: Taranacak maksimum sayfa (sonsuz döngü freni).
+            size: Maximum number of messages to return.
+            max_pages: Maximum number of pages to scan (infinite-loop brake).
         """
         from urllib.parse import quote_plus
 
@@ -1085,18 +1118,19 @@ class ProtonReader:
                 break
         return {"total": total, "query": query, "messages": messages[:size]}
 
-    # ── Mesaj oku + decrypt ──────────────────────────────────────────
+    # ── Read message + decrypt ───────────────────────────────────────
 
     def read(self, message_id):
-        """Mesajı oku ve decrypt et."""
+        """Read a message and decrypt it."""
         from urllib.parse import quote
-        # Proton ID'leri base64url — '-', '_', '=' korunmalı, sadece diğerleri encode
+        # Proton IDs are base64url — '-', '_', '=' must be preserved, only the
+        # rest is encoded
         safe_id = quote(message_id, safe='-_=+/')
         data = self._api(f"/mail/v4/messages/{safe_id}")
         msg = data.get("Message", {})
         body = msg.get("Body", "")
 
-        # PGP şifreli değilse doğrudan döndür
+        # If it is not PGP-encrypted, return it as-is
         if "BEGIN PGP" not in body:
             return {
                 "id": msg.get("ID"),
@@ -1182,14 +1216,14 @@ class ProtonReader:
         except WorkerError as e:
             return f"[decrypt error: {last_error or e}]"
 
-    # ── Bekle / Polling ──────────────────────────────────────────────
+    # ── Wait / Polling ───────────────────────────────────────────────
 
     def wait(self, subject=None, from_filter=None, to_filter=None, timeout=60, interval=3):
-        """Eşleşen mail gelene kadar bekle (polling).
-        to_filter: Hangi adrese geldiğini filtrele (subaddress dahil).
+        """Wait until a matching mail arrives (polling).
+        to_filter: Filter on which address received it (subaddress included).
 
-        inbox() listeleme endpoint'i ToList/CCList'i döndürdüğü için her mesaj
-        için ayrı API çağrısı YAPILMAZ — hız için kritik (N+1 önlenir)."""
+        Because the inbox() listing endpoint returns ToList/CCList, NO separate
+        API call is made per message — critical for speed (N+1 is avoided)."""
         deadline = time.time() + timeout
         seen_ids = set()
         tf = to_filter.lower().strip() if to_filter else None
@@ -1208,17 +1242,20 @@ class ProtonReader:
                         addrs = [a.lower() for a in (m.get("to", []) + m.get("cc", []))]
                         joined = " ".join(addrs)
                         if "+" in tf.split("@", 1)[0]:
-                            # tf tam subaddress (foo+tag@x) → SADECE tam eşleşme.
-                            # base match yapılırsa foo+other@x mailleri de eşleşir (yanlış kod!)
+                            # tf is a full subaddress (foo+tag@x) -> ONLY an
+                            # exact match. A base match would also match
+                            # foo+other@x mails (wrong code!)
                             if tf not in addrs:
                                 continue
                         else:
-                            # tf base adres (foo@x) → tam VEYA subaddress base eşleşmesi
+                            # tf is a base address (foo@x) -> exact OR
+                            # subaddress base match
                             if tf not in joined and not self._addr_base_match(tf, addrs):
                                 continue
                     return {"found": True, "message": m}
             except (RuntimeError, KeyError, httpx.HTTPError) as e:
-                # Geçici API hatası polling'i düşürmesin — deadline'a kadar devam
+                # A transient API error must not kill the polling — keep going
+                # until the deadline
                 log.warning("Polling error: %s", e)
             if time.time() >= deadline:
                 break
@@ -1227,7 +1264,8 @@ class ProtonReader:
 
     @staticmethod
     def _addr_base_match(target, addr_list):
-        """target (foo+tag@x veya foo@x) ile addr_list'teki adreslerin base'lerini karşılaştır."""
+        """Compare target (foo+tag@x or foo@x) with the bases of the addresses
+        in addr_list."""
         def base(e):
             e = (e or "").lower().strip()
             if "@" not in e:
@@ -1238,8 +1276,9 @@ class ProtonReader:
         return any(base(a) == tb for a in addr_list)
 
     def wait_code(self, subject=None, from_filter=None, to_filter=None, timeout=120, interval=3):
-        """Doğrulama kodu bekle — mail gelince subject + body'den kodu çıkar.
-        to_filter: Hangi adrese geldiğini filtrele."""
+        """Wait for a verification code — once the mail arrives, extract the
+        code from the subject + body.
+        to_filter: Filter on which address received it."""
         result = self.wait(subject=subject, from_filter=from_filter,
                            to_filter=to_filter, timeout=timeout, interval=interval)
         if not result["found"]:
@@ -1251,21 +1290,29 @@ class ProtonReader:
 
         return self._extract_code(subj, body)
 
-    # Kod parçaları. Gruplu biçim ("552-392", "123 456 789") en az bir ayırıcı
-    # ister; aksi halde alternatif sıfır tekrarla eşleşip düz biçime hiç sıra
-    # gelmez ve 6 haneli kodlar 4 haneye kesilir.
-    # Gruplu kodda grupların uzunluğu EŞİT olmalı (552-392, 123 456 789).
-    # "0850 123 45 67" gibi telefon numaraları eşit olmayan gruplardan oluşur;
-    # karışık uzunluğa izin verilirse numaranın ilk iki grubu kod sanılır.
+    # Code fragments. The grouped form ("552-392", "123 456 789") requires at
+    # least one separator; otherwise the alternative matches with zero
+    # repetitions, the plain form never gets its turn, and 6-digit codes are
+    # truncated to 4 digits.
+    # In a grouped code the groups must be EQUAL in length (552-392,
+    # 123 456 789). Phone numbers such as "0850 123 45 67" consist of unequal
+    # groups; if mixed lengths were allowed, the first two groups of the number
+    # would be mistaken for a code.
     _CODE_GROUPED = r'(?:\d{3}(?:[-\s]\d{3}){1,2}|\d{4}(?:[-\s]\d{4}){1,2})'
     _CODE_PLAIN = r'\d{4,10}'
-    # Alfanümerik kod (Steam "5KX2V", "a1b2c3"): 4-10 karakter, harf VE rakam
-    # içermeli, tek bir harf durumunda olmalı. Karışık durum ("Verify") ve saf
-    # harf dizileri kelimedir, kod değildir; bu yüzden ikisi de dışlanır.
+    # Alphanumeric code (Steam "5KX2V", "a1b2c3"): 4-10 characters, must contain
+    # BOTH letters and digits, and be in a single letter case. Mixed case
+    # ("Verify") and pure letter sequences are words, not codes; both are
+    # therefore excluded.
     _CODE_ALNUM = (r'(?:[A-Z0-9]{4,10}|[a-z0-9]{4,10})')
     _CODE_TOKEN = rf'({_CODE_GROUPED}|{_CODE_PLAIN})'
-    # Bağlam sözcükleri — servisler tek bir dil kullanmıyor. Her yeni dil burada
-    # bir alternatif; kod tarafında değişiklik gerekmez.
+    # Context words — services do not stick to one language. Every new language
+    # is one more alternative here; no code change is needed.
+    #
+    # These are match DATA, not prose: the literals must be spelled the way the
+    # sending service spells them, in every script (Latin, Cyrillic, Arabic,
+    # CJK, Hangul). Escaping some of them would only make the table harder to
+    # read without changing what it matches.
     _CODE_CTX = (
         r'(?:'
         # en
@@ -1274,7 +1321,8 @@ class ProtonReader:
         # tr
         r'|kod|kodu|kodunuz|doğrulama'
         # es/pt/it
-        r'|código|codigo|codice|verificación|verificacion|verificação|verificacao'
+        r'|código|codigo|codice|verificación|verificacion|verificação'
+        r'|verificacao'
         r'|verifica'
         # de/nl
         r'|bestätigungscode|bestatigungscode|sicherheitscode|verificatiecode'
@@ -1291,19 +1339,19 @@ class ProtonReader:
         r')'
     )
 
-    # Bir kodun ÖNÜNDE bulunmaması gereken işaretler:
-    #   '#'       → hex renk (#123456 kod değil)
-    #   ':' / '-' → CSS değeri veya devam eden rakam grubu
-    # ve SONRASINDA CSS birimi veya ondalık kısım olmamalı (600px, 1234.56).
-    # Cümle sonu noktası ("kodunuz 889900.") ondalık DEĞİLDİR: nokta yalnızca
-    # ardından rakam gelirse yasaklanır.
+    # Markers that must NOT appear BEFORE a code:
+    #   '#'       → hex colour (#123456 is not a code)
+    #   ':' / '-' → a CSS value or a continuing digit group
+    # and no CSS unit or decimal part may follow (600px, 1234.56).
+    # A sentence-ending period ("your code is 889900.") is NOT a decimal: the
+    # period is only banned when a digit follows it.
     _CODE_LEAD_BAN = r'(?<![#\d:\-])'
     _CODE_TRAIL_BAN = (r'(?!\s*(?:px|pt|em|rem|%|vh|vw|ex|ch|cm|mm|in|pc|deg|ms|s)\b)'
                        r'(?!\d)(?!\.\d)')
 
-    # CSS gövdeleri ("{ ... }"), fonksiyonel renk gösterimleri ve at-kuralları.
-    # Kapanmamış <style> gibi bozuk maillerde etiket temizliği yetmez, bu yüzden
-    # süslü parantezli bloklar metin düzeyinde de atılır.
+    # CSS bodies ("{ ... }"), functional colour notations and at-rules.
+    # In broken mails such as an unclosed <style>, stripping tags is not enough,
+    # so brace-delimited blocks are dropped at the text level as well.
     _CSS_BLOCK_RE = re.compile(r'\{[^{}]*\}')
     _CSS_AT_RULE_RE = re.compile(r'@[a-z-]+[^{;]*[{;]', re.IGNORECASE)
     _CSS_COLOR_FN_RE = re.compile(
@@ -1311,16 +1359,16 @@ class ProtonReader:
         re.IGNORECASE,
     )
     _MARKUP_RE = re.compile(r'(?s)<[^>]*>')
-    # Açılışı olan ama kapanışı olmayan script/style: satır sonuna kadar at.
+    # script/style with an opening but no closing tag: drop to end of input.
     _DANGLING_STYLE_RE = re.compile(r'(?is)<(?:script|style)\b.*')
     _STYLE_BLOCK_RE = re.compile(r'(?is)<(script|style)\b[^>]*>.*?</\1\s*>')
     _COMMENT_RE = re.compile(r'(?s)<!--.*?-->')
     _URL_RE = re.compile(r'\b[a-z][a-z0-9+.\-]*://\S+', re.IGNORECASE)
 
-    # Kutucuklara bölünmüş kodlar: <td>4</td><td>8</td>… veya <b>48</b><b>39</b>…
-    # Servisler kodu kutulara bölerek gösteriyor; etiketler boşlukla
-    # değiştirilince "4 8 3 9 2 0" olur ve hiçbir kod deseni eşleşmez.
-    # En az 3 ardışık kısa hücre birleştirilir.
+    # Codes split into boxes: <td>4</td><td>8</td>… or <b>48</b><b>39</b>…
+    # Services display the code split across boxes; once the tags are replaced
+    # with spaces it becomes "4 8 3 9 2 0" and no code pattern matches.
+    # At least 3 consecutive short cells are joined.
     _CELL_TAGS = r'(?:td|th|span|b|strong|em|i|div|p|h[1-6]|font|code)'
     _SPLIT_CELL_RE = re.compile(
         rf'(?is)((?:<{_CELL_TAGS}\b[^>]*>\s*[A-Za-z0-9]{{1,4}}\s*'
@@ -1330,18 +1378,19 @@ class ProtonReader:
 
     @classmethod
     def _join_split_cells(cls, html):
-        """Ardışık kısa hücreleri tek bir jetona birleştir.
+        """Join consecutive short cells into a single token.
 
-        Sadece 4-10 karakterlik makul bir kod oluşuyorsa birleştirilir; aksi
-        halde sıradan bir tablo sütununu (fiyat, adet) koda dönüştürürdük.
-        Orijinal metin korunur, böylece birleşmeyen hücreler normal akışta kalır.
+        They are only joined when the result is a plausible 4-10 character code;
+        otherwise we would turn an ordinary table column (price, quantity) into
+        a code. The original text is preserved, so cells that are not joined
+        stay in the normal flow.
         """
         def _join(m):
             parts = cls._CELL_CHAR_RE.findall(m.group(1))
             joined = "".join(parts)
             if not 4 <= len(joined) <= 10:
                 return m.group(1)
-            # Tüm hücreler tek karakter, ya da tümü sadece rakam olmalı.
+            # All cells must be single characters, or all must be digits only.
             if not (all(len(x) == 1 for x in parts) or all(x.isdigit() for x in parts)):
                 return m.group(1)
             return f" {joined} "
@@ -1349,66 +1398,67 @@ class ProtonReader:
 
     @classmethod
     def _visible_text(cls, html):
-        """HTML gövdeden görünür metni çıkar.
+        """Extract the visible text from an HTML body.
 
-        Mail gövdeleri HTML; ham metinde taranırsa stil kuralları, tracking
-        URL'leri ve renk değerlerindeki rakamlar kod sanılır. Sırası önemli:
-        yorumlar ve script/style blokları etiketlerden ÖNCE atılmalı, yoksa
-        içlerindeki CSS düz metin olarak kalır.
+        Mail bodies are HTML; scanning the raw text makes style rules, tracking
+        URLs and digits inside colour values look like codes. Order matters:
+        comments and script/style blocks must be dropped BEFORE the tags,
+        otherwise the CSS inside them survives as plain text.
         """
         if not html:
             return ""
         text = html
-        # 1. Yorumlar (mso koşullu blokları dahil) — içindeki CSS ile birlikte.
+        # 1. Comments (including mso conditional blocks) — with the CSS inside.
         text = cls._COMMENT_RE.sub(" ", text)
-        # 2. Kapanışlı script/style blokları, ardından kapanmamış kalıntı.
+        # 2. Closed script/style blocks, then the unclosed leftover.
         text = cls._STYLE_BLOCK_RE.sub(" ", text)
         text = cls._DANGLING_STYLE_RE.sub(" ", text)
-        # 3. Kutucuklara bölünmüş kodu etiketler silinmeden önce birleştir.
+        # 3. Join a code split across boxes before the tags are removed.
         text = cls._join_split_cells(text)
-        # 4. Etiketler (style="..." niteliklerini de götürür).
+        # 4. Tags (this also takes the style="..." attributes with it).
         text = cls._MARKUP_RE.sub(" ", text)
         text = unescape(text)
-        # 5. Etiketsiz kalan CSS: at-kuralları, süslü bloklar, renk fonksiyonları.
+        # 5. CSS left without tags: at-rules, brace blocks, colour functions.
         text = cls._CSS_AT_RULE_RE.sub(" ", text)
         text = cls._CSS_BLOCK_RE.sub(" ", text)
         text = cls._CSS_COLOR_FN_RE.sub(" ", text)
-        # 6. URL'ler — tracking id'leri kod değildir.
+        # 6. URLs — tracking ids are not codes.
         text = cls._URL_RE.sub(" ", text)
         return re.sub(r'[ \t\xa0]+', ' ', text)
 
     def _extract_code(self, subject, body):
-        """Subject + body'den doğrulama kodunu çıkar.
+        """Extract the verification code from the subject + body.
 
-        Desteklenen biçimler:
-          * 4-10 haneli düz kod (123456, 1234567)
-          * tire/boşlukla gruplanmış kod (552-392, 123 456 789)
-          * kutucuklara bölünmüş kod (<td>4</td><td>8</td>…)
-          * alfanümerik kod (Steam "5KX2V", "a1b2c3") — yalnızca bağlam varsa
+        Supported formats:
+          * 4-10 digit plain code (123456, 1234567)
+          * code grouped with dashes/spaces (552-392, 123 456 789)
+          * code split into boxes (<td>4</td><td>8</td>…)
+          * alphanumeric code (Steam "5KX2V", "a1b2c3") — only with context
 
-        Öncelik sırası:
-          1. Subject'te bağlama komşu sayısal kod (en güvenilir)
-          2. Gövdenin görünür metninde bağlama komşu sayısal kod
-          3. Subject/gövdede gruplu kod (ayırıcı tek başına ayırt edici)
-          4. Gövdede tek başına 6 haneli sayı
-          5. Bağlama komşu alfanümerik kod (en riskli — en sonda)
-        Bağlamsız "herhangi bir 4-8 haneli sayı" fallback'i YOK — yıl, sipariş
-        numarası ve tracking id'yi kod sanmasını önler. Hex renkler (#123456) ve
-        CSS birimli değerler (600000px) de kod sayılmaz.
+        Priority order:
+          1. Numeric code next to context in the subject (most reliable)
+          2. Numeric code next to context in the body's visible text
+          3. Grouped code in the subject/body (the separator alone is telling)
+          4. A standalone 6-digit number in the body
+          5. Alphanumeric code next to context (riskiest — tried last)
+        There is NO context-free "any 4-8 digit number" fallback — that prevents
+        a year, an order number or a tracking id from being mistaken for a code.
+        Hex colours (#123456) and values with CSS units (600000px) are not
+        treated as codes either.
         """
         lead, trail = self._CODE_LEAD_BAN, self._CODE_TRAIL_BAN
         token = lead + self._CODE_TOKEN + trail
         ctx = self._CODE_CTX
-        # Bağlam ile kod arasında rakam olmamalı; '#' de olmamalı, yoksa
-        # "code ... #123456" hex rengini kod sanar.
+        # There must be no digit between the context and the code, and no '#'
+        # either, otherwise "code ... #123456" mistakes a hex colour for a code.
         gap = r'[^0-9#]{0,40}'
-        # Bağlam koddan önce de ("code: 123456") sonra da ("123456 is your code")
-        # gelebilir; ikisi de aranır.
+        # The context can come before the code ("code: 123456") as well as after
+        # it ("123456 is your code"); both are searched.
         ctx_before = ctx + gap + token
         ctx_after = token + gap + ctx
 
         def _clean(m):
-            # tire/boşlukları sil → saf rakam
+            # strip dashes/spaces -> pure digits
             return re.sub(r'[-\s]', '', m)
 
         body_text = self._visible_text(body)
@@ -1421,7 +1471,8 @@ class ProtonReader:
                 if m:
                     return _clean(m.group(1))
 
-        # Gruplu kod — ayırıcı kendisi güçlü sinyal, bağlam gerekmez
+        # Grouped code — the separator is itself a strong signal, no context
+        # needed
         grouped = lead + f'({self._CODE_GROUPED})' + trail
         for haystack in (subject, body_text):
             if not haystack:
@@ -1430,15 +1481,16 @@ class ProtonReader:
             if m:
                 return _clean(m.group(1))
 
-        # Gövdede tek başına 6 haneli (en yaygın kod uzunluğu)
+        # A standalone 6-digit number in the body (the most common code length)
         m = re.search(lead + r'(\d{6})' + trail, body_text)
         if m:
             return m.group(1)
 
-        # Alfanümerik kod — SADECE bağlam sözcüğünün yanında. Bağlamsız aranırsa
-        # her "Account", "Hello2you" gibi jeton kod sanılır.
-        # Bağlam ile kod arasına dolgu sözcükleri girebilir ("code is 5KX2V",
-        # "kodunuz: ABC123"), o yüzden en fazla 3 kısa kelimeye izin verilir.
+        # Alphanumeric code — ONLY next to a context word. Searched without
+        # context, every token like "Account" or "Hello2you" would look like a
+        # code. Filler words can sit between the context and the code
+        # ("code is 5KX2V", "your code: ABC123"), so up to 3 short words are
+        # allowed.
         alnum = rf'(?<![A-Za-z0-9])({self._CODE_ALNUM})(?![A-Za-z0-9])'
         filler = r'(?:[^A-Za-z0-9]{0,10}(?:[a-z]{1,6}[^A-Za-z0-9]{0,10}){0,3})'
         for haystack in (subject, body_text):
@@ -1449,14 +1501,16 @@ class ProtonReader:
                     if self._is_alnum_code(m.group(1)):
                         return m.group(1)
 
-        return None  # kod bulunamadı — ham body DÖNDÜRME (yanlış kod izlenimi verir)
+        # no code found — do NOT return the raw body (it looks like a bogus code)
+        return None
 
     @staticmethod
     def _is_alnum_code(token):
-        """Alfanümerik jeton gerçekten kod mu?
+        """Is this alphanumeric token really a code?
 
-        Kod hem harf hem rakam içerir ve tek durumdadır. Bu, "Account" gibi saf
-        kelimeleri ve "Verify2FA" gibi karışık durumlu metni dışlar.
+        A code contains both letters and digits and is in a single case. That
+        excludes pure words such as "Account" and mixed-case text such as
+        "Verify2FA".
         """
         has_digit = any(ch.isdigit() for ch in token)
         has_alpha = any(ch.isalpha() for ch in token)
@@ -1468,7 +1522,7 @@ class ProtonReader:
     # ── User info ────────────────────────────────────────────────────
 
     def user_info(self):
-        """Kullanıcı bilgisi."""
+        """User information."""
         data = self._api("/core/v4/users")
         u = data["User"]
         return {
@@ -1480,12 +1534,14 @@ class ProtonReader:
         }
 
     def addresses(self, use_cache=True):
-        """Hesaptaki tüm adresleri listele (tüm sayfalar + members).
+        """List every address on the account (all pages + members).
 
-        /core/v4/addresses sayfa başına en fazla 150 adres döner; Total alanına
-        göre sayfalanır. Members API'den eksik adresler de eklenir.
+        /core/v4/addresses returns at most 150 addresses per page; pagination
+        follows the Total field. Addresses missing from the Members API are
+        added as well.
 
-        use_cache: True ise 5 dk TTL'li cache kullanır (Proton page 1 ~9s).
+        use_cache: When True, a cache with a 5 min TTL is used (Proton page 1
+                   takes ~9s).
         """
         now = time.time()
         if use_cache and self._addr_cache is not None \
@@ -1496,8 +1552,9 @@ class ProtonReader:
         for a in self._fetch_addresses_raw(with_keys=False):
             addr_map[a["email"].lower()] = a
 
-        # Members API'den eksik adresleri de ekle. Kişisel hesaplarda bu endpoint
-        # yoktur (403/422) — adres listesi yine geçerli, o yüzden hata ölümcül değil.
+        # Add addresses missing from the Members API as well. On personal
+        # accounts this endpoint does not exist (403/422) — the address list is
+        # still valid, so the error is not fatal.
         try:
             members_data = self._api("/core/v4/members")
         except (RuntimeError, httpx.HTTPError) as e:
@@ -1522,23 +1579,25 @@ class ProtonReader:
         return result
 
     def _invalidate_addr_cache(self):
-        """Adres cache'ini geçersiz kıl (yeni adres eklenince çağrılmalı)."""
+        """Invalidate the address cache (must be called when an address
+        changes)."""
         self._addr_cache = None
         self._addr_cache_time = 0
 
     def _fetch_addresses_raw(self, with_keys=False, max_pages=None):
-        """Tüm adresleri sayfalayarak çek.
+        """Fetch every address, page by page.
 
-        Hesap tipine göre hiçbir üst sınır YOK: Business hesabında binlerce alias
-        olabilir, hepsi çekilir. PageSize=150 Proton'un kendi tavanı.
+        There is NO upper bound based on account type: a Business account may
+        have thousands of aliases and all of them are fetched. PageSize=150 is
+        Proton's own ceiling.
 
         Args:
-            with_keys: True ise ham API kaydını (Keys dahil) döndürür.
-                       False ise sadeleştirilmiş dict döndürür.
-            max_pages: Sonsuz döngü freni. None ise sınırsız — döngü yine de
-                       Total'a veya kısa sayfaya ulaşınca durur.
+            with_keys: When True, the raw API record (including Keys) is
+                       returned. When False, a simplified dict is returned.
+            max_pages: Infinite-loop brake. When None there is no limit — the
+                       loop still stops once Total or a short page is reached.
         """
-        PAGE_SIZE = 150  # API üst sınırı
+        PAGE_SIZE = 150  # API upper bound
         out = []
         seen = set()
         page = 0
@@ -1578,7 +1637,7 @@ class ProtonReader:
         return out
 
     def org_info(self):
-        """Organizasyon bilgisi."""
+        """Organization information."""
         data = self._api("/core/v4/organizations")
         org = data.get("Organization", {})
         return {
@@ -1590,25 +1649,25 @@ class ProtonReader:
             "used_domains": org.get("UsedDomains"),
         }
 
-    # ── Adres ekleme ─────────────────────────────────────────────────
+    # ── Address creation ─────────────────────────────────────────────
 
     def create_address(self, local_part, domain="proton.me"):
         """
-        Yeni @proton.me alias adresi oluştur — tamamen HTTP tabanlı.
-        1. POST /core/v4/addresses → adres oluştur
-        2. Key üret (Node.js openpgp.js — patched, SHA-3 kaldırıldı)
-        3. POST /core/v4/keys/address → key kaydet
+        Create a new @proton.me alias address — fully HTTP-based.
+        1. POST /core/v4/addresses → create the address
+        2. Generate a key (Node.js openpgp.js — patched, SHA-3 removed)
+        3. POST /core/v4/keys/address → register the key
 
         Args:
-            local_part: @ işaretinden önceki kısım (ör: "mynewaddr")
-            domain: domain adı (varsayılan: proton.me)
+            local_part: The part before the @ sign (e.g. "mynewaddr")
+            domain: Domain name (default: proton.me)
 
         Returns:
             dict: {"email": "...", "address_id": "...", "fingerprint": "..."}
         """
         email = f"{local_part}@{domain}"
 
-        # 1. Adres oluştur
+        # 1. Create the address
         addr_data = self._api("/core/v4/addresses", method="POST", json={
             "DisplayName": local_part,
             "Signature": "",
@@ -1618,12 +1677,12 @@ class ProtonReader:
         address = addr_data.get("Address", {})
         address_id = address.get("ID")
         if not address_id:
-            raise RuntimeError(f"Adres oluşturulamadı: {addr_data}")
+            raise RuntimeError(f"Address creation failed: {addr_data}")
 
-        # 2. Key üret
+        # 2. Generate a key
         key_data = self._generate_address_key(email)
 
-        # 3. Key'i kaydet
+        # 3. Register the key
         result = self._api("/core/v4/keys/address", method="POST", json={
             "AddressID": address_id,
             "Primary": 1,
@@ -1633,12 +1692,12 @@ class ProtonReader:
             "Token": key_data["token"],
         })
         if result.get("Code") != 1000:
-            raise RuntimeError(f"Key kayıt hatası: {result}")
+            raise RuntimeError(f"Key registration failed: {result}")
 
-        # Anahtarı YERELE de yaz. _decrypt_body yalnızca
-        # config["address_keys"] üzerinden dener; buraya eklenmezse yeni
-        # adrese gelen mail, Proton'da anahtar kayıtlı olmasına rağmen
-        # çözülemez ve setup() tekrar çağrılana kadar öyle kalır.
+        # Write the key LOCALLY as well. _decrypt_body only tries keys from
+        # config["address_keys"]; if it is not added here, mail arriving at the
+        # new address cannot be decrypted even though the key is registered with
+        # Proton, and it stays that way until setup() is called again.
         self.config.setdefault("address_keys", {})[email] = {
             "address_id": address_id,
             "private_key": key_data["private_key"],
@@ -1656,12 +1715,12 @@ class ProtonReader:
 
     def create_addresses_batch(self, names, domain="proton.me"):
         """
-        Toplu adres ekleme — tamamen HTTP tabanlı, browser gerekmez.
-        Her adres ~2-3 saniye sürer.
+        Bulk address creation — fully HTTP-based, no browser needed.
+        Each address takes ~2-3 seconds.
 
         Args:
-            names: adres isimlerinin listesi (ör: ["addr1", "addr2", ...])
-            domain: domain adı (varsayılan: proton.me)
+            names: List of address names (e.g. ["addr1", "addr2", ...])
+            domain: Domain name (default: proton.me)
 
         Returns:
             list: [{"email": "...", "success": bool}, ...]
@@ -1694,10 +1753,11 @@ class ProtonReader:
         return worker.generate_key(email, key_password, primary_key)
 
     def disable_address(self, address_id):
-        """Adresi devre dışı bırak — mail almayı durdurur, adres durur.
+        """Disable an address — it stops receiving mail, the address stays.
 
-        Adres cache'i düşürülür: aksi halde addresses() 5 dakika boyunca
-        eski `status` değerini döndürür ve çağıran adresi hâlâ etkin sanır.
+        The address cache is dropped: otherwise addresses() would return the old
+        `status` value for 5 minutes and the caller would think the address is
+        still enabled.
         """
         result = self._api(f"/core/v4/addresses/{address_id}/disable",
                            method="PUT")
@@ -1705,42 +1765,42 @@ class ProtonReader:
         return result
 
     def enable_address(self, address_id):
-        """Devre dışı bırakılmış adresi tekrar aç."""
+        """Re-enable a disabled address."""
         result = self._api(f"/core/v4/addresses/{address_id}/enable",
                            method="PUT")
         self._invalidate_addr_cache()
         return result
 
     def delete_address(self, address_id, email=None):
-        """Adresi sil (sadece alias/secondary adresler silinebilir).
+        """Delete an address (only alias/secondary addresses can be deleted).
 
-        Proton etkin bir adresi silmeyi reddeder (409, Code 2502:
-        "Address is enabled. Please disable it before deleting"), bu yüzden
-        silme öncesi devre dışı bırakma burada yapılır — çağıranın iki adımı
-        ezberlemesi gerekmez.
+        Proton refuses to delete an enabled address (409, Code 2502:
+        "Address is enabled. Please disable it before deleting"), so disabling
+        before deleting happens right here — the caller does not have to
+        memorize the two steps.
 
         Args:
-            address_id: Silinecek adresin ID'si.
-            email: Biliniyorsa, yerel anahtar kaydı da temizlenir. Bilinmiyorsa
-                   address_id ile eşleşen kayıt aranır.
+            address_id: ID of the address to delete.
+            email: When known, the local key record is cleaned up too. When
+                   unknown, the record matching address_id is looked up.
         """
         disabled_here = False
         try:
             self.disable_address(address_id)
             disabled_here = True
         except RuntimeError as e:
-            # Zaten devre dışıysa Proton yine 4xx döndürebilir; silme denemesi
-            # asıl doğrulama, bu yüzden burada durmuyoruz.
+            # If it is already disabled, Proton may still return a 4xx; the
+            # delete attempt is the real check, so we do not stop here.
             log.debug("disable before delete failed (continuing): %s", e)
 
         try:
             result = self._api(f"/core/v4/addresses/{address_id}",
                                method="DELETE")
         except RuntimeError:
-            # Silme reddedildi (ör. Code 2011: yılda yalnızca bir adres
-            # silinebilir). Devre dışı bırakmayı BİZ yaptıysak geri al —
-            # yoksa çağıran hiç istemediği halde adresi kapatmış olur ve
-            # o adrese gelen mail sessizce reddedilmeye başlar.
+            # The delete was refused (e.g. Code 2011: only one address may be
+            # deleted per year). If WE did the disabling, undo it — otherwise
+            # the caller ends up with an address switched off without ever
+            # asking for it, and mail sent to it starts being silently rejected.
             if disabled_here:
                 try:
                     self.enable_address(address_id)
@@ -1754,8 +1814,8 @@ class ProtonReader:
                     )
             raise
 
-        # Yerel anahtar kaydını da düş: kalırsa _decrypt_body her mesajda
-        # ölü bir anahtarı denemeye devam eder.
+        # Drop the local key record too: if it stays, _decrypt_body keeps trying
+        # a dead key on every message.
         addr_keys = self.config.get("address_keys", {})
         stale = [
             e for e, info in addr_keys.items()
@@ -1776,75 +1836,82 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="Proton Mail Reader")
     parser.add_argument("--config", required=True,
-                        help="Hesap config dosyası (JSON)")
+                        help="Account config file (JSON)")
     parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Ayrıntılı günlük (token yenileme, rate limit, vb.)")
+                        help="Verbose logging (token refresh, rate limit, etc.)")
     sub = parser.add_subparsers(dest="command")
 
     # inbox
-    p_inbox = sub.add_parser("inbox", help="Inbox listele")
-    p_inbox.add_argument("--unread", action="store_true", help="Sadece okunmamış")
-    p_inbox.add_argument("--size", type=int, default=20, help="Sayfa boyutu")
+    p_inbox = sub.add_parser("inbox", help="List the inbox")
+    p_inbox.add_argument("--unread", action="store_true", help="Unread only")
+    p_inbox.add_argument("--size", type=int, default=20, help="Page size")
 
     # read
-    p_read = sub.add_parser("read", help="Mesaj oku")
-    p_read.add_argument("msg_id", help="Mesaj ID'si")
+    p_read = sub.add_parser("read", help="Read a message")
+    p_read.add_argument("msg_id", help="Message ID")
 
     # search
-    p_search = sub.add_parser("search", help="Inbox'ta ara")
-    p_search.add_argument("query", help="Arama sorgusu")
+    p_search = sub.add_parser("search", help="Search the inbox")
+    p_search.add_argument("query", help="Search query")
 
     # wait
-    p_wait = sub.add_parser("wait", help="Mail bekle (polling)")
-    p_wait.add_argument("--subject", default="", help="Konu filtresi")
-    p_wait.add_argument("--from", dest="from_filter", default="", help="Gönderen filtresi")
-    p_wait.add_argument("--timeout", type=int, default=60, help="Zaman aşımı (sn)")
+    p_wait = sub.add_parser("wait", help="Wait for mail (polling)")
+    p_wait.add_argument("--subject", default="", help="Subject filter")
+    p_wait.add_argument("--from", dest="from_filter", default="",
+                        help="Sender filter")
+    p_wait.add_argument("--timeout", type=int, default=60,
+                        help="Timeout (seconds)")
 
     # code
-    p_code = sub.add_parser("code", help="Doğrulama kodu bekle")
-    p_code.add_argument("--subject", default="", help="Konu filtresi")
-    p_code.add_argument("--from", dest="from_filter", default="", help="Gönderen filtresi")
-    p_code.add_argument("--timeout", type=int, default=120, help="Zaman aşımı (sn)")
+    p_code = sub.add_parser("code", help="Wait for a verification code")
+    p_code.add_argument("--subject", default="", help="Subject filter")
+    p_code.add_argument("--from", dest="from_filter", default="",
+                        help="Sender filter")
+    p_code.add_argument("--timeout", type=int, default=120,
+                        help="Timeout (seconds)")
 
-    # login — email+password ile sıfırdan oturum
+    # login — session from scratch with email+password
     p_login = sub.add_parser(
-        "login", help="E-posta + şifre ile login (CAPTCHA otomatik çözülür)"
+        "login", help="Log in with email + password (CAPTCHA solved automatically)"
     )
     p_login.add_argument("--show-browser", action="store_true",
-                         help="CAPTCHA tarayıcısını görünür çalıştır (hata ayıklama)")
+                         help="Run the CAPTCHA browser visibly (for debugging)")
     p_login.add_argument("--slow-mo", type=int, default=0, metavar="MS",
-                         help="Görünür modda eylem başına gecikme (ms), ör. 300")
-    p_login.add_argument("--keep-open", type=int, default=0, metavar="SN",
-                         help="Hata anında tarayıcıyı açık tut (sn)")
+                         help="Per-action delay in visible mode (ms), e.g. 300")
+    p_login.add_argument("--keep-open", type=int, default=0, metavar="SEC",
+                         help="Keep the browser open on failure (seconds)")
 
     # setup
-    sub.add_parser("setup", help="API'den key bilgilerini çek")
+    sub.add_parser("setup", help="Fetch key information from the API")
 
     # refresh
-    sub.add_parser("refresh", help="Token yenile")
+    sub.add_parser("refresh", help="Refresh the token")
 
     # user
-    sub.add_parser("user", help="Kullanıcı bilgisi")
+    sub.add_parser("user", help="User information")
 
     # addresses
-    sub.add_parser("addresses", help="Adresleri listele")
+    sub.add_parser("addresses", help="List addresses")
 
     # create-address
-    p_create = sub.add_parser("create-address", help="Yeni @proton.me alias ekle")
-    p_create.add_argument("name", help="Adres ismi (@ işaretinden önceki kısım)")
-    p_create.add_argument("--domain", default="proton.me", help="Domain (varsayılan: proton.me)")
+    p_create = sub.add_parser("create-address",
+                              help="Add a new @proton.me alias")
+    p_create.add_argument("name", help="Address name (the part before the @)")
+    p_create.add_argument("--domain", default="proton.me",
+                          help="Domain (default: proton.me)")
 
     # disable-address / enable-address / delete-address
     for cmd, helptext in (
-        ("disable-address", "Adresi devre dışı bırak"),
-        ("enable-address", "Devre dışı adresi tekrar aç"),
-        ("delete-address", "Adresi sil (yılda 1 hak; önce devre dışı bırakılır)"),
+        ("disable-address", "Disable an address"),
+        ("enable-address", "Re-enable a disabled address"),
+        ("delete-address",
+         "Delete an address (1 per year; it is disabled first)"),
     ):
         p = sub.add_parser(cmd, help=helptext)
-        p.add_argument("address_id", help="Adres ID'si (addresses komutundan)")
+        p.add_argument("address_id", help="Address ID (from the addresses command)")
 
     # org
-    sub.add_parser("org", help="Organizasyon bilgisi")
+    sub.add_parser("org", help="Organization information")
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -1861,27 +1928,27 @@ def main():
 def _dispatch(parser, args, reader):
     if args.command == "inbox":
         result = reader.inbox(size=args.size, unread_only=args.unread)
-        print(f"Toplam: {result['total']} mesaj")
+        print(f"Total: {result['total']} messages")
         for m in result["messages"]:
             flag = "📩" if m["unread"] else "  "
             print(f"  {flag} [{m['id'][:12]}] {m['from'][:30]:30s} │ {m['subject'][:50]}")
 
     elif args.command == "read":
         msg = reader.read(args.msg_id)
-        print(f"Kimden: {msg['from']} ({msg['from_name']})")
-        print(f"Konu:   {msg['subject']}")
-        print(f"Zaman:  {msg['time']}")
+        print(f"From:    {msg['from']} ({msg['from_name']})")
+        print(f"Subject: {msg['subject']}")
+        print(f"Time:    {msg['time']}")
         print("─" * 60)
         print(msg["body"])
 
     elif args.command == "search":
         result = reader.search(args.query)
-        print(f"'{args.query}' için {len(result['messages'])} sonuç:")
+        print(f"'{args.query}': {len(result['messages'])} results")
         for m in result["messages"]:
             print(f"  [{m['id'][:12]}] {m['from'][:30]:30s} │ {m['subject'][:50]}")
 
     elif args.command == "wait":
-        print(f"Mail bekleniyor... (timeout={args.timeout}s)")
+        print(f"Waiting for mail... (timeout={args.timeout}s)")
         result = reader.wait(
             subject=args.subject or None,
             from_filter=args.from_filter or None,
@@ -1889,22 +1956,22 @@ def _dispatch(parser, args, reader):
         )
         if result["found"]:
             m = result["message"]
-            print(f"✅ Bulundu: {m['from']} — {m['subject']}")
+            print(f"✅ Found: {m['from']} — {m['subject']}")
             print(f"   ID: {m['id']}")
         else:
-            print("❌ Zaman aşımı — mail bulunamadı")
+            print("❌ Timed out — no mail found")
 
     elif args.command == "code":
-        print(f"Doğrulama kodu bekleniyor... (timeout={args.timeout}s)")
+        print(f"Waiting for a verification code... (timeout={args.timeout}s)")
         code = reader.wait_code(
             subject=args.subject or None,
             from_filter=args.from_filter or None,
             timeout=args.timeout,
         )
         if code:
-            print(f"✅ Kod: {code}")
+            print(f"✅ Code: {code}")
         else:
-            print("❌ Kod bulunamadı")
+            print("❌ No code found")
 
     elif args.command == "setup":
         data = reader.setup()
@@ -1912,7 +1979,7 @@ def _dispatch(parser, args, reader):
 
     elif args.command == "login":
         data = reader.login(
-            # --show-browser verilmezse None: karar PROTON_HEADLESS'a kalır.
+            # None unless --show-browser is given: PROTON_HEADLESS decides.
             headless=False if args.show_browser else None,
             slow_mo=args.slow_mo,
             keep_open=args.keep_open,
@@ -1927,15 +1994,16 @@ def _dispatch(parser, args, reader):
         print(json.dumps(info, indent=2))
 
     elif args.command == "addresses":
-        # ID ve status olmadan liste işe yaramaz: disable/delete komutları ID
-        # ister, ve devre dışı bir adres etkin olanla aynı görünürdü.
-        # Ölçüldü: disable → Status=0 (Receive=0, Send=0), enable → Status=1.
-        status_names = {0: "devre dışı", 1: "etkin"}
+        # A listing without ID and status is useless: the disable/delete
+        # commands need the ID, and a disabled address would look identical to
+        # an enabled one.
+        # Measured: disable → Status=0 (Receive=0, Send=0), enable → Status=1.
+        status_names = {0: "disabled", 1: "enabled"}
         for a in reader.addresses():
             status = status_names.get(a["status"], a["status"])
-            kind = "birincil" if a["type"] == 1 else "alias"
+            kind = "primary" if a["type"] == 1 else "alias"
             print(f"  {a['email']}")
-            print(f"    {kind}, {status}, {a['keys']} anahtar")
+            print(f"    {kind}, {status}, {a['keys']} key(s)")
             print(f"    id: {a['id']}")
 
     elif args.command == "create-address":

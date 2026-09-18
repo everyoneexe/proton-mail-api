@@ -18,7 +18,7 @@ from .reader import HumanVerificationRequired, ProtonMailClient, ProtonReader
 
 try:
     __version__ = _pkg_version("proton-mail-api")
-except PackageNotFoundError:  # çalışma ağacından import (kurulum yok)
+except PackageNotFoundError:  # imported from the working tree (no install)
     __version__ = "0.0.0.dev0"
 
 __all__ = [
