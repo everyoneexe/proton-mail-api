@@ -368,7 +368,7 @@ cd proton-mail-api
 pip install -e '.[all]'
 cd proton_mail_api/decrypt && npm install && cd -
 
-pytest tests/ -q          # 162 tests, no network required
+pytest tests/ -q          # 165 tests, no network required
 ruff check proton_mail_api tests
 ```
 
