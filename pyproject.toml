@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proton-mail-api"
+version = "2.0.0"
+description = "Proton Mail HTTP API client with PGP decrypt and multi-account support"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "everyoneexe"},
+]
+keywords = ["proton", "protonmail", "email", "pgp", "decrypt", "api"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email",
+]
+dependencies = [
+    "httpx>=0.24",
+    "bcrypt>=4.0",
+]
+
+[project.optional-dependencies]
+gateway = ["flask>=2.0"]
+browser = ["playwright>=1.30"]
+srp = ["proton-client>=0.5", "python-gnupg>=0.5"]
+captcha = ["playwright>=1.30", "opencv-python-headless>=4.8", "numpy>=1.24"]
+all = [
+    "flask>=2.0",
+    "playwright>=1.30",
+    "proton-client>=0.5",
+    "python-gnupg>=0.5",
+    "opencv-python-headless>=4.8",
+    "numpy>=1.24",
+]
+
+[project.scripts]
+proton-mail = "proton_mail_api.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/everyoneexe/proton-mail-api"
+Repository = "https://github.com/everyoneexe/proton-mail-api"
+Issues = "https://github.com/everyoneexe/proton-mail-api/issues"
+
+[tool.setuptools.packages.find]
+include = ["proton_mail_api*"]
+
+[tool.setuptools.package-data]
+proton_mail_api = [
+    "decrypt/*.mjs",
+    "decrypt/package.json",
+    "decrypt/node_modules/**/*",
+]

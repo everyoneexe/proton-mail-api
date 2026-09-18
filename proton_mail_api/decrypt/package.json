@@ -1,0 +1,9 @@
+{
+  "name": "proton-decrypt",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "openpgp": "^6.1.0"
+  }
+}
