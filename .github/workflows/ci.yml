@@ -86,11 +86,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # node_modules is untracked, so a checkout has none. The wheel is
+      # expected to ship the vendored openpgp build, which means `npm install`
+      # is a build prerequisite, not a developer convenience: building without
+      # it produces a package whose PGP worker cannot start.
+      - name: Vendor the Node dependencies
+        working-directory: proton_mail_api/decrypt
+        run: npm install --no-audit --no-fund --omit=dev
+
       - run: pip install build twine
       - run: python -m build
       - run: twine check dist/*
-      # The wheel must carry worker.mjs and the vendored openpgp build, since
-      # node_modules is deliberately untracked in git.
+
       - name: Verify the wheel bundles the PGP worker
         run: |
           python - <<'EOF'
@@ -99,4 +110,17 @@ jobs:
           assert 'proton_mail_api/decrypt/worker.mjs' in names, 'worker.mjs missing'
           assert any('node_modules/openpgp' in n for n in names), 'openpgp missing'
           print(f'ok: {len(names)} files, worker and openpgp present')
+          EOF
+
+      # The wheel is the artefact users actually get: install it somewhere
+      # clean and confirm the bundled worker starts.
+      - name: Install the wheel and start the worker
+        run: |
+          python -m venv /tmp/wheelcheck
+          /tmp/wheelcheck/bin/pip install --quiet dist/*.whl
+          /tmp/wheelcheck/bin/python - <<'EOF'
+          from proton_mail_api.crypto_worker import get_worker, stop_worker
+          assert get_worker().ping() is True, 'bundled worker did not answer'
+          stop_worker()
+          print('ok: bundled Node worker answered ping')
           EOF

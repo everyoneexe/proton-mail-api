@@ -152,8 +152,14 @@ def test_save_config_is_private_and_atomic(client, config_path):
     client.config["key_salt"] = "abc"
     client._save_config()
 
-    mode = stat.S_IMODE(os.stat(config_path).st_mode)
-    assert mode == 0o600, f"secrets world-readable: {oct(mode)}"
+    # POSIX permission bits do not exist on Windows: os.chmod there only
+    # toggles the read-only flag, so the mode comes back 0o666 no matter what
+    # was requested. Asserting 0o600 unconditionally fails on a platform the
+    # package claims to support.
+    if hasattr(os, "fchmod"):
+        mode = stat.S_IMODE(os.stat(config_path).st_mode)
+        assert mode == 0o600, f"secrets world-readable: {oct(mode)}"
+
     with open(config_path) as f:
         assert json.load(f)["key_salt"] == "abc"
     # No temp file left behind.

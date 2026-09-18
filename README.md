@@ -394,6 +394,23 @@ is stubbed so the browser paths are testable without a browser installed.
 Tests assert observable behaviour, not implementation. If you add one, it should
 fail for a plausible bug — not merely because the code changed.
 
+### Building a release
+
+`node_modules` is untracked, but the wheel is expected to ship the vendored
+`openpgp` build — so `npm install` is a **build prerequisite**, not a developer
+convenience. Building from a fresh checkout without it produces a package whose
+PGP worker cannot start:
+
+```bash
+cd proton_mail_api/decrypt && npm install --omit=dev && cd -
+python -m build
+twine check dist/*
+```
+
+CI enforces this: the build job asserts the wheel contains `worker.mjs` and
+`node_modules/openpgp`, then installs the wheel into a clean venv and pings the
+worker.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
