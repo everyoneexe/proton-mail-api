@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "proton-mail-api"
-version = "1.0.0"
+version = "1.0.1"
 description = "Proton Mail HTTP API client with PGP decrypt and multi-account support"
 readme = "README.md"
 license = {text = "MIT"}
