@@ -8,6 +8,7 @@ the same HTTP API the web client uses, performs the SRP handshake, and decrypts
 message bodies locally — so a script can read Proton mail without a browser
 sitting open.
 
+[![CI](https://github.com/everyoneexe/proton-mail-api/actions/workflows/ci.yml/badge.svg)](https://github.com/everyoneexe/proton-mail-api/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/proton-mail-api)](https://pypi.org/project/proton-mail-api/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -89,18 +90,22 @@ playwright install chromium
 
 ### Platforms
 
-Pure Python plus a Node subprocess, so Linux, macOS, and Windows all work.
-Two details are worth knowing:
+Pure Python plus a Node subprocess. CI runs the full suite plus a worker/config
+smoke test on **Linux, macOS, and Windows**, against Python 3.10 and 3.13.
+
+Three details are worth knowing:
 
 - Node is located with `shutil.which`, so an nvm/fnm `node.cmd` shim on Windows
   is found. If Node lives somewhere PATH does not reach, point
   `PROTON_NODE_BIN` at the executable.
 - Diagnostics (CAPTCHA dumps, failed-login screenshots) go to the platform temp
   directory — `TMPDIR` on POSIX, `%TEMP%` on Windows — not a literal `/tmp`.
+- Config files are read and written as UTF-8, so a non-Latin-1 password works
+  everywhere.
 
-Config files are written with owner-only permissions where the OS supports it.
-On Windows the `0600` bit does not apply; the file still holds your password and
-PGP private keys, so keep it out of a shared directory.
+Config files get owner-only permissions where the OS enforces them. Windows does
+not: `os.fchmod` exists there but the mode still reads back `0o666`. The file
+holds your password and PGP private keys, so keep it out of a shared directory.
 
 ## Quick start
 
