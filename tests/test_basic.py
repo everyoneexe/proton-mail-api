@@ -131,6 +131,28 @@ def test_an_explicit_node_binary_wins(monkeypatch):
     assert crypto_worker._resolve_node() == "/opt/custom/node"
 
 
+def test_a_non_ascii_config_round_trips(tmp_path):
+    """os.fdopen defaults to cp1252 on Windows, which cannot encode this.
+
+    A password or display name outside Latin-1 made _save_config raise
+    UnicodeEncodeError there, so the session could never be stored.
+    """
+    path = tmp_path / "unicode.json"
+    path.write_text(json.dumps({
+        "email": "a@proton.me",
+        "password": "şifre-ğüö-中文-🔑",
+    }), encoding="utf-8")
+
+    with ProtonMailClient(str(path)) as c:
+        c.config["note"] = "Doğrulama 验证码 인증번호"
+        c._save_config()
+
+    # Re-read through the client, not just the file: both directions must agree.
+    with ProtonMailClient(str(path)) as reopened:
+        assert reopened.password == "şifre-ğüö-中文-🔑"
+        assert reopened.config["note"] == "Doğrulama 验证码 인증번호"
+
+
 def test_auth_headers_track_the_current_token(client):
     """Callers rely on the shared client carrying the live token."""
     assert client._http.headers["x-pm-uid"] == "test-uid"

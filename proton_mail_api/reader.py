@@ -118,7 +118,7 @@ class ProtonReader:
         # A missing or malformed config is a setup mistake, not a bug: report it
         # in one line instead of a stack trace through open()/json.load().
         try:
-            with open(self.config_path) as f:
+            with open(self.config_path, encoding="utf-8") as f:
                 self.config = json.load(f)
         except FileNotFoundError:
             raise FileNotFoundError(
@@ -171,7 +171,12 @@ class ProtonReader:
                     os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
                 except OSError:
                     pass
-            with os.fdopen(fd, "w") as f:
+            # UTF-8 explicitly: os.fdopen defaults to the platform's preferred
+            # encoding, which is cp1252 on Windows, so a password or display
+            # name outside Latin-1 raised UnicodeEncodeError and the session
+            # could never be stored. ensure_ascii=False below means the bytes
+            # really are non-ASCII.
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self.config, f, indent=2, ensure_ascii=False)
                 f.flush()
                 os.fsync(f.fileno())
